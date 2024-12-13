@@ -94,7 +94,12 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 		return "", err
 	}
 
-	return pathname.(string), c.bucket.LinkActionToOutput(ctx, actionID, outputID)
+	_, err = c.bucket.LinkActionToOutput(ctx, actionID, outputID)
+	if err != nil {
+		return pathname.(string), fmt.Errorf("linking action to output: %w", err)
+	}
+
+	return pathname.(string), err
 }
 
 func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {

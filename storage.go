@@ -97,16 +97,16 @@ func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string,
 	return filepath.Base(outputPathname), nil
 }
 
-func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string) error {
+func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
 	outputPathname := filepath.Join("..", outputDir, outputID)
 
 	err := os.Symlink(outputPathname, actionPathname)
 	if errors.Is(err, os.ErrExist) {
-		return nil
+		return true, nil
 	}
 
-	return err
+	return false, err
 }
 
 func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (string, error) {
@@ -127,16 +127,16 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	return attr.Metadata["output_id"], nil
 }
 
-func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) error {
-	err := b.bucket.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
+func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
+	exists, err := b.disk.LinkActionToOutput(ctx, actionID, outputID)
+	if err != nil || exists {
+		return exists, err
+	}
+
+	return false, b.bucket.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
 		Metadata:    map[string]string{"output_id": outputID},
 		ContentType: "plain/text",
 	})
-	if err != nil {
-		return err
-	}
-
-	return b.disk.LinkActionToOutput(ctx, actionID, outputID)
 }
 
 func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
