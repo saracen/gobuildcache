@@ -123,6 +123,9 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}
+	if err != nil {
+		return "", fmt.Errorf("attribute for %v: %w", actionID, err)
+	}
 
 	return attr.Metadata["output_id"], nil
 }
