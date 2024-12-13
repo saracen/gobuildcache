@@ -8,7 +8,7 @@
 export GOCACHEPROG="./gobuildcache <bucket url>"
 ```
 
-A test is performed to see if permissions allow for write or read. For GCS, the bucket URL param `?access_id=-` has to be used to force unauthenicated mode. This is useful in scenarios where you only want to provide read access to your bucket's caches.
+A readonly mode is supported, which works well if `?anonymous=true` is also passed as a bucket parameter to the bucket URL if the bucket is publically accessible. This parameter seems to only be supported by GCS and S3 though.
 
 For more information on supported bucket URL parameters see https://gocloud.dev/howto/blob/#services.
 
@@ -16,3 +16,4 @@ For more information on supported bucket URL parameters see https://gocloud.dev/
 
 - `-v` for verbose logging.
 - `-p` to specify key prefix.
+- `-readonly` to only support fetching of cache items.

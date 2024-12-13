@@ -97,7 +97,7 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	return pathname.(string), c.bucket.LinkActionToOutput(ctx, actionID, outputID)
 }
 
-func run(ctx context.Context, prefix, bucketURL string) error {
+func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return fmt.Errorf("getting cache dir: %w", err)
@@ -122,28 +122,10 @@ func run(ctx context.Context, prefix, bucketURL string) error {
 		return fmt.Errorf("creating cache output dir: %w", err)
 	}
 
-	const capTestKey = "write_test"
-	var caps []cmd
-	if err := bucket.Upload(ctx, capTestKey, bytes.NewReader(nil), &blob.WriterOptions{ContentType: "plain/text"}); err != nil {
-		slog.Error("write mode disabled", "err", err)
-	} else {
-		slog.Info("write mode enabled")
+	caps := []cmd{cmdClose, cmdGet}
+	if !readonly {
 		caps = append(caps, cmdPut)
 	}
-
-	// checking for read-only access doesn't work with GCS, instead an unauthenticated client
-	// is set by setting GoogleAccessID to "-" (via Options or via the URL parameter "access_id")
-	if err := bucket.Download(ctx, capTestKey, io.Discard, &blob.ReaderOptions{}); err != nil {
-		slog.Error("read mode disabled", "err", err)
-	} else {
-		slog.Info("read mode enabled")
-		caps = append(caps, cmdGet)
-	}
-
-	if len(caps) == 0 {
-		slog.Warn("could not create read or write cache")
-	}
-	caps = append(caps, "close")
 
 	r, w := bufio.NewReader(os.Stdin), bufio.NewWriter(originalStdout)
 	dec, enc := json.NewDecoder(r), json.NewEncoder(w)
@@ -247,9 +229,11 @@ func init() {
 func main() {
 	var prefix string
 	var verbose bool
+	var readonly bool
 
 	flag.StringVar(&prefix, "p", "", "prefix")
 	flag.BoolVar(&verbose, "v", false, "verbose")
+	flag.BoolVar(&readonly, "readonly", false, "readonly")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "%s <bucket url>\n", os.Args[0])
 		flag.PrintDefaults()
@@ -267,7 +251,7 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	if err := run(context.Background(), prefix, flag.Arg(0)); err != nil {
+	if err := run(context.Background(), prefix, flag.Arg(0), readonly); err != nil {
 		slog.Error("run error", "err", err)
 		os.Exit(1)
 	}
