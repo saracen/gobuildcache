@@ -202,7 +202,11 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 			case cmdGet:
 				now := time.Now()
 				resp.DiskPath, err = cacher.Get(ctx, &req)
-				slog.Info("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
+				if err != nil {
+					slog.Error("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
+				} else {
+					slog.Info("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
+				}
 
 				if err != nil {
 					resp.Err = err.Error()
@@ -214,7 +218,11 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 			case cmdPut:
 				now := time.Now()
 				resp.DiskPath, err = cacher.Put(ctx, &req)
-				slog.Info("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
+				if err != nil {
+					slog.Error("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
+				} else {
+					slog.Info("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
+				}
 
 				if err != nil {
 					resp.Err = err.Error()

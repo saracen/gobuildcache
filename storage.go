@@ -177,7 +177,7 @@ func (b *Bucket) Start(ctx context.Context) {
 				err = b.bucket.Upload(ctx, path.Join(outputDir, filepath.Base(pathname)), f, &blob.WriterOptions{ContentType: "application/octet-stream"})
 				f.Close()
 				if err != nil {
-					slog.Error("uploading file", "path", pathname, "err", err)
+					slog.Error("uploading file", "path", pathname, "err", err, "took", time.Since(now))
 				} else {
 					slog.Info("uploaded file", "path", pathname, "took", time.Since(now))
 				}
