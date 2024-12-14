@@ -44,13 +44,13 @@ type request struct {
 
 type response struct {
 	ID            int64
-	Err           string `json:",omitempty"`
-	KnownCommands []cmd  `json:",omitempty"`
-	Miss          bool   `json:",omitempty"`
-	OutputID      []byte `json:",omitempty"`
-	Size          int64  `json:",omitempty"`
-	TimeNanos     int64  `json:",omitempty"`
-	DiskPath      string `json:",omitempty"`
+	Err           string     `json:",omitempty"`
+	KnownCommands []cmd      `json:",omitempty"`
+	Miss          bool       `json:",omitempty"`
+	OutputID      []byte     `json:",omitempty"`
+	Size          int64      `json:",omitempty"`
+	Time          *time.Time `json:",omitempty"`
+	DiskPath      string     `json:",omitempty"`
 }
 
 type Cacher struct {
@@ -184,7 +184,8 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 							resp.Err = "invalid output id"
 						}
 						resp.Size = fi.Size()
-						resp.TimeNanos = fi.ModTime().UnixNano()
+						modTime := fi.ModTime()
+						resp.Time = &modTime
 					}
 				}
 

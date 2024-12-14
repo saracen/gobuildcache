@@ -56,6 +56,8 @@ func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (str
 		return outputPathname, true, nil
 	}
 
+	slog.Info("persisting to disk", "path", outputPathname)
+
 	f, err := os.CreateTemp(d.cacheDir, "output")
 	if err != nil {
 		return "", false, fmt.Errorf("creating temporary output file: %w", err)
@@ -169,6 +171,7 @@ func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (s
 		return pathname, true, nil
 	}
 
+	slog.Info("scheduling upload", "path", pathname)
 	b.jobs <- pathname
 
 	return pathname, false, nil
