@@ -119,15 +119,33 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		return outputID, nil
 	}
 
+	// TODO: come up with a better solution for this scenario
+	// If we fetch from remote storage and there's nothing there, we store an "empty" link,
+	// just so that we don't keep trying to fetch this (it adds latency, only to find nothing).
+	// The downside is that if at some point it does exist in remote storage, we might not
+	// immediately observe that.
+	cacheEmptyOutputPath := filepath.Join(b.disk.cacheDir, actionDir, actionID+".empty")
+	if _, err := os.Stat(cacheEmptyOutputPath); err == nil {
+		return "", nil
+	}
+
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
 	if gcerrors.Code(err) == gcerrors.NotFound {
+		os.WriteFile(cacheEmptyOutputPath, nil, 0o600)
 		return "", nil
 	}
 	if err != nil {
 		return "", fmt.Errorf("attribute for %v: %w", actionID, err)
 	}
 
-	return attr.Metadata["output_id"], nil
+	outputID = attr.Metadata["output_id"]
+	if outputID == "" {
+		return "", nil
+	}
+
+	b.disk.LinkActionToOutput(ctx, actionID, outputID)
+
+	return outputID, nil
 }
 
 func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
