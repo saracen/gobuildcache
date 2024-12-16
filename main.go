@@ -61,6 +61,9 @@ type Cacher struct {
 
 func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 	actionID := hex.EncodeToString(req.ActionID)
+
+	slog.Info("get", "action", actionID)
+
 	outputID, err := c.bucket.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		return "", fmt.Errorf("getting output id from action (bucket): %w", err)
@@ -80,6 +83,8 @@ func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	actionID := hex.EncodeToString(req.ActionID)
 	outputID := hex.EncodeToString(req.OutputID)
+
+	slog.Info("put", "action", actionID, "output", outputID)
 
 	pathname, err, shared := c.flight.Do("put"+outputID, func() (any, error) {
 		pathname, _, err := c.bucket.PutOutput(ctx, outputID, req.Body)
