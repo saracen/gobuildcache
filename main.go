@@ -72,9 +72,11 @@ func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 		return "", nil
 	}
 
+	slog.Info("single flight get", "action", actionID, "output", outputID)
 	pathname, err, shared := c.flight.Do("get"+outputID, func() (any, error) {
 		return c.bucket.GetOutput(ctx, outputID)
 	})
+	slog.Info("single flight get done", "action", actionID, "output", outputID)
 
 	if shared {
 		slog.Info("get output shared", "output", outputID)

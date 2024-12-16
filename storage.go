@@ -118,6 +118,7 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	}
 
 	if outputID != "" {
+		slog.Info("returning output id", "action", actionID, "output", outputID)
 		return outputID, nil
 	}
 
@@ -128,11 +129,14 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	// immediately observe that.
 	cacheEmptyOutputPath := filepath.Join(b.disk.cacheDir, actionDir, actionID+".empty")
 	if _, err := os.Stat(cacheEmptyOutputPath); err == nil {
+		slog.Info("empty found", "action", actionID, "output", outputID)
 		return "", nil
 	}
 
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
+	slog.Info("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
+		slog.Info("created found", "action", actionID, "output", outputID)
 		os.WriteFile(cacheEmptyOutputPath, nil, 0o600)
 		return "", nil
 	}
@@ -142,9 +146,11 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 
 	outputID = attr.Metadata["output_id"]
 	if outputID == "" {
+		slog.Info("no metadata output id", "action", actionID, "output", outputID)
 		return "", nil
 	}
 
+	slog.Info("linking action to output from outpit from action", "action", actionID, "output", outputID)
 	b.disk.LinkActionToOutput(ctx, actionID, outputID)
 
 	return outputID, nil
@@ -218,17 +224,26 @@ func (b *Bucket) Close() {
 }
 
 func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error) {
+	slog.Info("getting output from disk", "action", "output", outputID)
+
 	pathname, err := b.disk.GetOutput(ctx, outputID)
 	if err != nil {
 		return "", err
 	}
 
+	slog.Info("got output from disk", "action", "output", outputID, "path", pathname, "err", err)
+
 	if _, err := os.Stat(pathname); err == nil {
+		slog.Info("returning pathname", "output", outputID, "path", pathname)
+
 		return pathname, nil
 	}
 
+	slog.Info("downloading", "output", outputID)
+
 	buf := new(bytes.Buffer)
 	err = b.bucket.Download(ctx, path.Join(outputDir, outputID), buf, &blob.ReaderOptions{})
+	slog.Info("downloaded", "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}
@@ -236,6 +251,11 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return "", err
 	}
 
+	slog.Info("putting download to disk", "output", outputID, "size", buf.Len())
+
 	pathname, _, err = b.disk.PutOutput(ctx, outputID, bytes.NewReader(buf.Bytes()))
+
+	slog.Info("putting download to disk done", "output", outputID, "size", buf.Len())
+
 	return pathname, err
 }
