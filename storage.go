@@ -227,22 +227,15 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return pathname, nil
 	}
 
-	pr, pw := io.Pipe()
-	defer pw.Close()
-	defer pr.Close()
-
-	go func() {
-		err := b.bucket.Download(ctx, path.Join(outputDir, outputID), pw, &blob.ReaderOptions{})
-		if err != nil {
-			pw.CloseWithError(err)
-		}
-		pw.Close()
-	}()
-
-	pathname, _, err = b.disk.PutOutput(ctx, outputID, pr)
+	buf := new(bytes.Buffer)
+	err = b.bucket.Download(ctx, path.Join(outputDir, outputID), buf, &blob.ReaderOptions{})
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}
+	if err != nil {
+		return "", err
+	}
 
+	pathname, _, err = b.disk.PutOutput(ctx, outputID, bytes.NewReader(buf.Bytes()))
 	return pathname, err
 }
