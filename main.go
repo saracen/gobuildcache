@@ -62,7 +62,7 @@ type Cacher struct {
 func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 	actionID := hex.EncodeToString(req.ActionID)
 
-	slog.Info("get", "action", actionID)
+	slog.Debug("get", "action", actionID)
 
 	outputID, err := c.bucket.OutputIDFromAction(ctx, actionID)
 	if err != nil {
@@ -72,12 +72,14 @@ func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 		return "", nil
 	}
 
+	slog.Debug("single flight get", "action", actionID, "output", outputID)
 	pathname, err, shared := c.flight.Do("get"+outputID, func() (any, error) {
 		return c.bucket.GetOutput(ctx, outputID)
 	})
+	slog.Debug("single flight get done", "action", actionID, "output", outputID)
 
 	if shared {
-		slog.Info("get output shared", "output", outputID)
+		slog.Debug("get output shared", "output", outputID)
 	}
 
 	return pathname.(string), err
@@ -87,7 +89,7 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	actionID := hex.EncodeToString(req.ActionID)
 	outputID := hex.EncodeToString(req.OutputID)
 
-	slog.Info("put", "action", actionID, "output", outputID)
+	slog.Debug("put", "action", actionID, "output", outputID)
 
 	pathname, err, shared := c.flight.Do("put"+outputID, func() (any, error) {
 		pathname, _, err := c.bucket.PutOutput(ctx, outputID, req.Body)
@@ -95,7 +97,7 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	})
 
 	if shared {
-		slog.Info("put output shared", "output", outputID)
+		slog.Debug("put output shared", "output", outputID)
 	}
 
 	if err != nil {
@@ -214,7 +216,7 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 				if err != nil {
 					slog.Error("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
 				} else {
-					slog.Info("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
+					slog.Debug("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
 				}
 
 				if err != nil {
@@ -230,7 +232,7 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 				if err != nil {
 					slog.Error("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
 				} else {
-					slog.Info("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
+					slog.Debug("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
 				}
 
 				if err != nil {
@@ -267,9 +269,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	level := slog.LevelError
+	level := slog.LevelInfo
 	if verbose {
-		level = slog.LevelInfo
+		level = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 

@@ -56,7 +56,7 @@ func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (str
 		return outputPathname, true, nil
 	}
 
-	slog.Info("persisting to disk", "path", outputPathname)
+	slog.Debug("persisting to disk", "path", outputPathname)
 
 	f, err := os.CreateTemp(d.cacheDir, "output")
 	if err != nil {
@@ -118,6 +118,7 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	}
 
 	if outputID != "" {
+		slog.Debug("returning output id", "action", actionID, "output", outputID)
 		return outputID, nil
 	}
 
@@ -128,11 +129,14 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	// immediately observe that.
 	cacheEmptyOutputPath := filepath.Join(b.disk.cacheDir, actionDir, actionID+".empty")
 	if _, err := os.Stat(cacheEmptyOutputPath); err == nil {
+		slog.Debug("empty found", "action", actionID, "output", outputID)
 		return "", nil
 	}
 
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
+	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
+		slog.Debug("created found", "action", actionID, "output", outputID)
 		os.WriteFile(cacheEmptyOutputPath, nil, 0o600)
 		return "", nil
 	}
@@ -142,9 +146,11 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 
 	outputID = attr.Metadata["output_id"]
 	if outputID == "" {
+		slog.Debug("no metadata output id", "action", actionID, "output", outputID)
 		return "", nil
 	}
 
+	slog.Debug("linking action to output from output from action", "action", actionID, "output", outputID)
 	b.disk.LinkActionToOutput(ctx, actionID, outputID)
 
 	return outputID, nil
@@ -171,7 +177,7 @@ func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (s
 		return pathname, true, nil
 	}
 
-	slog.Info("scheduling upload", "path", pathname)
+	slog.Debug("scheduling upload", "path", pathname)
 	b.jobs <- pathname
 
 	return pathname, false, nil
@@ -200,7 +206,7 @@ func (b *Bucket) Start(ctx context.Context) {
 				if err != nil {
 					slog.Error("uploading file", "path", pathname, "err", err, "took", time.Since(now))
 				} else {
-					slog.Info("uploaded file", "path", pathname, "took", time.Since(now))
+					slog.Debug("uploaded file", "path", pathname, "took", time.Since(now))
 				}
 			}
 		}()
@@ -208,27 +214,36 @@ func (b *Bucket) Start(ctx context.Context) {
 }
 
 func (b *Bucket) Close() {
-	slog.Info("waiting for uploads...")
+	slog.Debug("waiting for uploads...")
 
 	now := time.Now()
 	close(b.jobs)
 	b.wg.Wait()
 
-	slog.Info("waited for uploads", "took", time.Since(now))
+	slog.Debug("waited for uploads", "took", time.Since(now))
 }
 
 func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error) {
+	slog.Debug("getting output from disk", "output", outputID)
+
 	pathname, err := b.disk.GetOutput(ctx, outputID)
 	if err != nil {
 		return "", err
 	}
 
+	slog.Debug("got output from disk", "output", outputID, "path", pathname, "err", err)
+
 	if _, err := os.Stat(pathname); err == nil {
+		slog.Debug("returning pathname", "output", outputID, "path", pathname)
+
 		return pathname, nil
 	}
 
+	slog.Debug("downloading", "output", outputID)
+
 	buf := new(bytes.Buffer)
 	err = b.bucket.Download(ctx, path.Join(outputDir, outputID), buf, &blob.ReaderOptions{})
+	slog.Debug("downloaded", "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}
@@ -236,6 +251,11 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return "", err
 	}
 
+	slog.Debug("putting download to disk", "output", outputID, "size", buf.Len())
+
 	pathname, _, err = b.disk.PutOutput(ctx, outputID, bytes.NewReader(buf.Bytes()))
+
+	slog.Debug("putting download to disk done", "output", outputID, "size", buf.Len())
+
 	return pathname, err
 }
