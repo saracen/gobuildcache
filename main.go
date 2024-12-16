@@ -68,6 +68,9 @@ func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("getting output id from action (bucket): %w", err)
 	}
+	if outputID == "" {
+		return "", nil
+	}
 
 	pathname, err, shared := c.flight.Do("get"+outputID, func() (any, error) {
 		return c.bucket.GetOutput(ctx, outputID)
