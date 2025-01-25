@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,17 @@ import (
 	_ "gocloud.dev/blob/s3blob"
 	"golang.org/x/sync/singleflight"
 )
+
+type flagArray []string
+
+func (v *flagArray) String() string {
+	return fmt.Sprintf("%v", *v)
+}
+
+func (v *flagArray) Set(value string) error {
+	*v = append(*v, value)
+	return nil
+}
 
 type cmd string
 
@@ -254,15 +266,25 @@ func main() {
 	var prefix string
 	var verbose bool
 	var readonly bool
+	var envmap flagArray
 
 	flag.StringVar(&prefix, "p", "", "prefix")
 	flag.BoolVar(&verbose, "v", false, "verbose")
 	flag.BoolVar(&readonly, "readonly", false, "readonly")
+	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "%s <bucket url>\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	for _, env := range envmap {
+		key, val, ok := strings.Cut(env, "=")
+		if !ok {
+			continue
+		}
+		os.Setenv(key, os.Getenv(val))
+	}
 
 	if flag.NArg() != 1 {
 		flag.Usage()
