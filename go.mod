@@ -3,6 +3,7 @@ module github.com/saracen/gobuildcache
 go 1.26.0
 
 require (
+	cloud.google.com/go/storage v1.68.0
 	gocloud.dev v0.46.0
 	golang.org/x/sync v0.23.0
 )
@@ -15,7 +16,6 @@ require (
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	cloud.google.com/go/iam v1.14.0 // indirect
 	cloud.google.com/go/monitoring v1.31.0 // indirect
-	cloud.google.com/go/storage v1.68.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.12.0 // indirect

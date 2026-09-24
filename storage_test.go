@@ -7,16 +7,21 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"gocloud.dev/blob"
+	"gocloud.dev/blob/gcsblob"
 	"gocloud.dev/blob/memblob"
+	"gocloud.dev/gcp"
 )
 
 func TestIsValidID(t *testing.T) {
@@ -737,5 +742,98 @@ func TestBreaker_ResetsOnSuccess(t *testing.T) {
 	br.record(failure)
 	if br.allow() {
 		t.Error("breaker didn't trip")
+	}
+}
+
+// fakeGCS stands in for the Cloud Storage API. It answers the first failures
+// writes with a 503 and the rest with success.
+type fakeGCS struct {
+	failures int64
+	requests atomic.Int64
+}
+
+func (f *fakeGCS) RoundTrip(r *http.Request) (*http.Response, error) {
+	f.requests.Add(1)
+	if r.Body != nil {
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+	}
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Body:       io.NopCloser(strings.NewReader(`{"bucket":"bucket","name":"key"}`)),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Request:    r,
+	}
+	if r.Method != http.MethodGet && f.failures > 0 {
+		f.failures--
+		resp.StatusCode = http.StatusServiceUnavailable
+		resp.Status = "503 Service Unavailable"
+		resp.Body = http.NoBody
+	}
+	return resp, nil
+}
+
+// gcsBucket returns a bucket that uses the gcsblob driver and sends its
+// requests to transport.
+func gcsBucket(t *testing.T, transport http.RoundTripper) *blob.Bucket {
+	t.Helper()
+
+	bucket, err := gcsblob.OpenBucket(context.Background(),
+		gcp.NewAnonymousHTTPClient(transport), "bucket", nil)
+	if err != nil {
+		t.Fatalf("opening gcs bucket: %v", err)
+	}
+	t.Cleanup(func() { bucket.Close() })
+
+	return bucket
+}
+
+// Any backend other than GCS leaves As unsatisfied, and using the client
+// regardless would dereference a nil pointer.
+func TestSetGCSUploadRetryLeavesOtherBackendsAlone(t *testing.T) {
+	bucket := memblob.OpenBucket(nil)
+	defer bucket.Close()
+
+	setGCSUploadRetry(bucket)
+}
+
+func TestUploadRetry(t *testing.T) {
+	tests := []struct {
+		name         string
+		retry        bool
+		wantErr      bool
+		wantRequests int64
+	}{
+		{
+			name:         "without the policy one 503 fails the upload",
+			wantErr:      true,
+			wantRequests: 1,
+		},
+		{
+			name:         "with the policy the upload recovers",
+			retry:        true,
+			wantRequests: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := &fakeGCS{failures: 1}
+			bucket := gcsBucket(t, transport)
+			if tt.retry {
+				setGCSUploadRetry(bucket)
+			}
+
+			err := bucket.Upload(context.Background(), "key", bytes.NewReader(nil),
+				&blob.WriterOptions{ContentType: "text/plain"})
+			if (err != nil) != tt.wantErr {
+				t.Errorf("upload returned %v, want error: %v", err, tt.wantErr)
+			}
+			if got := transport.requests.Load(); got != tt.wantRequests {
+				t.Errorf("made %d requests, want %d", got, tt.wantRequests)
+			}
+		})
 	}
 }
