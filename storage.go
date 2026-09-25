@@ -68,7 +68,7 @@ type Disk struct {
 type Bucket struct {
 	disk   *Disk
 	bucket *blob.Bucket
-	jobs   chan uploadJob
+	jobs   chan queuedJob
 	wg     sync.WaitGroup
 
 	// outputs deduplicates output uploads within this process, so that an
@@ -81,6 +81,11 @@ type Bucket struct {
 	// readonly keeps puts local, never uploading them.
 	readonly bool
 
+	// refreshAfter is how old an object must be before a writer that uses it
+	// refreshes it; zero disables refreshing. See refresh.go.
+	refreshAfter time.Duration
+	refreshed    sync.Map // key -> struct{}
+
 	closeOnce sync.Once
 }
 
@@ -91,6 +96,12 @@ type Bucket struct {
 type uploadJob struct {
 	actionID string
 	outputID string
+}
+
+// queuedJob is one of the kinds of work done in the background.
+type queuedJob struct {
+	upload  *uploadJob
+	refresh *refreshJob
 }
 
 type outputUpload struct {
@@ -263,6 +274,14 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		return "", fmt.Errorf("invalid output_id %q in bucket metadata for action %s", outputID, actionID)
 	}
 
+	if b.shouldRefresh(attr.ModTime) {
+		b.scheduleRefresh(refreshJob{
+			key:         path.Join(actionDir, actionID),
+			metadata:    map[string]string{"output_id": outputID},
+			contentType: "text/plain",
+		})
+	}
+
 	slog.Debug("linking action to output from output from action", "action", actionID, "output", outputID)
 	if _, err := b.disk.LinkActionToOutput(ctx, actionID, outputID); err != nil {
 		slog.Warn("linking action to output", "action", actionID, "output", outputID, "err", err)
@@ -278,7 +297,7 @@ func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID stri
 	}
 
 	slog.Debug("scheduling upload", "action", actionID, "output", outputID)
-	if err := b.enqueueUpload(uploadJob{actionID: actionID, outputID: outputID}); err != nil {
+	if err := b.enqueue(queuedJob{upload: &uploadJob{actionID: actionID, outputID: outputID}}); err != nil {
 		return false, err
 	}
 
@@ -289,10 +308,10 @@ func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (s
 	return b.disk.PutOutput(ctx, outputID, r)
 }
 
-// enqueueUpload sends to the job channel, recovering if a concurrent Close
-// has shut it down. A protocol-conformant driver issues no puts after close,
-// but a malformed one would otherwise panic the process.
-func (b *Bucket) enqueueUpload(job uploadJob) (err error) {
+// enqueue sends to the job channel, recovering if a concurrent Close has
+// shut it down. A protocol-conformant driver issues no puts after close, but
+// a malformed one would otherwise panic the process.
+func (b *Bucket) enqueue(job queuedJob) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("upload queue closed: %v", r)
@@ -332,20 +351,26 @@ func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	key := path.Join(outputDir, outputID)
 
+	local := filepath.Join(b.disk.cacheDir, outputDir, outputID)
+
 	// Outputs are content addressed, so if it's already there it's identical.
 	// Writers mostly produce outputs that another job has already uploaded;
-	// checking first is a lot cheaper than uploading it again.
-	exists, err := b.bucket.Exists(ctx, key)
-	if err != nil {
+	// checking first is a lot cheaper than uploading it again, and it only
+	// needs refreshing if it's getting old.
+	attrs, err := b.bucket.Attributes(ctx, key)
+	if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
 		slog.Debug("checking output exists", "output", outputID, "err", err)
 	}
-	if exists {
+	if err == nil {
 		slog.Debug("output already uploaded", "output", outputID)
 		b.stats.UploadsSkipped.Add(1)
+		if b.shouldRefresh(attrs.ModTime) {
+			b.refreshNow(ctx, refreshJob{key: key, contentType: "application/octet-stream", local: local})
+		}
 		return nil
 	}
 
-	f, err := os.Open(filepath.Join(b.disk.cacheDir, outputDir, outputID))
+	f, err := os.Open(local)
 	if err != nil {
 		return err
 	}
@@ -377,7 +402,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 
 func (b *Bucket) Start(ctx context.Context) {
 	// queue up to 1000
-	b.jobs = make(chan uploadJob, 1000)
+	b.jobs = make(chan queuedJob, 1000)
 
 	// 20 workers ought to be enough for anybody
 	for range 20 {
@@ -387,11 +412,22 @@ func (b *Bucket) Start(ctx context.Context) {
 
 			for job := range b.jobs {
 				now := time.Now()
-				if err := b.upload(ctx, job); err != nil {
-					b.stats.UploadErrors.Add(1)
-					slog.Error("upload", "action", job.actionID, "output", job.outputID, "err", err, "took", time.Since(now))
-				} else {
-					slog.Debug("uploaded", "action", job.actionID, "output", job.outputID, "took", time.Since(now))
+				switch {
+				case job.upload != nil:
+					if err := b.upload(ctx, *job.upload); err != nil {
+						b.stats.UploadErrors.Add(1)
+						slog.Error("upload", "action", job.upload.actionID, "output", job.upload.outputID, "err", err, "took", time.Since(now))
+					} else {
+						slog.Debug("uploaded", "action", job.upload.actionID, "output", job.upload.outputID, "took", time.Since(now))
+					}
+
+				case job.refresh != nil:
+					if err := b.refresh(ctx, *job.refresh); err != nil {
+						b.stats.RefreshErrors.Add(1)
+						slog.Error("refresh", "key", job.refresh.key, "err", err, "took", time.Since(now))
+					} else {
+						slog.Debug("refreshed", "key", job.refresh.key, "took", time.Since(now))
+					}
 				}
 			}
 		}()
@@ -477,6 +513,10 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 
 	b.stats.Downloads.Add(1)
 	b.stats.DownloadBytes.Add(size)
+
+	if b.shouldRefresh(rdr.ModTime()) {
+		b.scheduleRefresh(refreshJob{key: path.Join(outputDir, outputID), contentType: "application/octet-stream", local: pathname})
+	}
 
 	slog.Debug("downloaded to disk", "output", outputID, "size", size)
 
