@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -135,7 +134,7 @@ func (d *Disk) GetOutput(ctx context.Context, outputID string) (string, error) {
 func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
 
-	outputPathname, err := os.Readlink(actionPathname)
+	outputID, err := readActionLink(actionPathname)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
@@ -143,32 +142,65 @@ func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string,
 		return "", err
 	}
 
-	outputID := filepath.Base(outputPathname)
 	if !isValidID(outputID) {
-		return "", fmt.Errorf("invalid output id %q in action symlink %s", outputID, actionPathname)
+		return "", fmt.Errorf("invalid output id %q in action link %s", outputID, actionPathname)
 	}
 	return outputID, nil
 }
 
+// readActionLink returns the output ID an action link refers to. Links are
+// files containing the output ID; older versions used symlinks to the output,
+// which aren't reliably available on Windows.
+func readActionLink(pathname string) (string, error) {
+	fi, err := os.Lstat(pathname)
+	if err != nil {
+		return "", err
+	}
+
+	if fi.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(pathname)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Base(target), nil
+	}
+
+	data, err := os.ReadFile(pathname)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes.TrimSpace(data)), nil
+}
+
 func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
-	outputPathname := filepath.Join("..", outputDir, outputID)
 
-	// Check if existing symlink already points to the correct output
-	existing, err := os.Readlink(actionPathname)
-	if err == nil && existing == outputPathname {
+	if existing, err := readActionLink(actionPathname); err == nil && existing == outputID {
 		return true, nil
 	}
 
-	// Atomically create/replace symlink by creating at temp path then renaming
-	tmpPathname := fmt.Sprintf("%s.tmp.%x", actionPathname, rand.Uint64())
-	// Conceivably the temporary filename could already exist and this would
-	// error, but it seems unlikely enough to not worry about.
-	if err := os.Symlink(outputPathname, tmpPathname); err != nil {
+	// Write to a temporary file and rename, so readers never see a partial link.
+	f, err := os.CreateTemp(filepath.Join(d.cacheDir, actionDir), actionID+".tmp.*")
+	if err != nil {
 		return false, err
 	}
-	if err := os.Rename(tmpPathname, actionPathname); err != nil {
-		os.Remove(tmpPathname)
+	defer os.Remove(f.Name())
+
+	_, err = f.WriteString(outputID)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return false, err
+	}
+
+	// A legacy symlink would be replaced by the rename on unix, but not on
+	// Windows, so remove it first.
+	if fi, err := os.Lstat(actionPathname); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		os.Remove(actionPathname)
+	}
+
+	if err := os.Rename(f.Name(), actionPathname); err != nil {
 		return false, err
 	}
 	return false, nil

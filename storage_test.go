@@ -605,3 +605,64 @@ func TestBucketPutAfterClose(t *testing.T) {
 		t.Error("expected error from LinkActionToOutput after Close")
 	}
 }
+
+func TestDiskLinkActionToOutput_WritesFile(t *testing.T) {
+	d := newDisk(t)
+	ctx := context.Background()
+
+	actionID := strings.Repeat("a", 64)
+	outputID := strings.Repeat("b", 64)
+
+	if _, err := d.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Lstat(filepath.Join(d.cacheDir, actionDir, actionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Errorf("action link mode = %v, want a regular file", fi.Mode())
+	}
+}
+
+func TestDiskOutputIDFromAction_LegacySymlink(t *testing.T) {
+	d := newDisk(t)
+	ctx := context.Background()
+
+	actionID := strings.Repeat("a", 64)
+	outputID := strings.Repeat("b", 64)
+	actionPath := filepath.Join(d.cacheDir, actionDir, actionID)
+	if err := os.Symlink(filepath.Join("..", outputDir, outputID), actionPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	got, err := d.OutputIDFromAction(ctx, actionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != outputID {
+		t.Errorf("got %q, want %q", got, outputID)
+	}
+
+	// Relinking replaces the legacy symlink with a file.
+	newOutput := strings.Repeat("c", 64)
+	if _, err := d.LinkActionToOutput(ctx, actionID, newOutput); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := d.OutputIDFromAction(ctx, actionID); got != newOutput {
+		t.Errorf("got %q, want %q after relink", got, newOutput)
+	}
+}
+
+func TestDiskOutputIDFromAction_RejectsInvalidFile(t *testing.T) {
+	d := newDisk(t)
+	actionID := strings.Repeat("a", 64)
+	actionPath := filepath.Join(d.cacheDir, actionDir, actionID)
+	if err := os.WriteFile(actionPath, []byte("../../etc/passwd"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.OutputIDFromAction(context.Background(), actionID); err == nil {
+		t.Error("expected error for invalid link contents")
+	}
+}
