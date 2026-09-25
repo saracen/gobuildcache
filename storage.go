@@ -76,6 +76,8 @@ type Bucket struct {
 	// action link is only ever published after its output is in the bucket.
 	outputs sync.Map // outputID -> *outputUpload
 
+	stats Stats
+
 	closeOnce sync.Once
 }
 
@@ -197,6 +199,7 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		slog.Debug("empty marker expired", "action", actionID)
 	}
 
+	b.stats.RemoteLookups.Add(1)
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
 	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
@@ -291,6 +294,7 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	}
 	if exists {
 		slog.Debug("output already uploaded", "output", outputID)
+		b.stats.UploadsSkipped.Add(1)
 		return nil
 	}
 
@@ -300,7 +304,26 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	}
 	defer f.Close()
 
-	return b.bucket.Upload(ctx, key, f, &blob.WriterOptions{ContentType: "application/octet-stream"})
+	n := &countingReader{r: f}
+	if err := b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"}); err != nil {
+		return err
+	}
+
+	b.stats.Uploads.Add(1)
+	b.stats.UploadBytes.Add(n.n)
+
+	return nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func (b *Bucket) Start(ctx context.Context) {
@@ -316,6 +339,7 @@ func (b *Bucket) Start(ctx context.Context) {
 			for job := range b.jobs {
 				now := time.Now()
 				if err := b.upload(ctx, job); err != nil {
+					b.stats.UploadErrors.Add(1)
 					slog.Error("upload", "action", job.actionID, "output", job.outputID, "err", err, "took", time.Since(now))
 				} else {
 					slog.Debug("uploaded", "action", job.actionID, "output", job.outputID, "took", time.Since(now))
@@ -396,6 +420,9 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return "", fmt.Errorf("renaming output: %w", err)
 	}
 	keep = true
+
+	b.stats.Downloads.Add(1)
+	b.stats.DownloadBytes.Add(size)
 
 	slog.Debug("downloaded to disk", "output", outputID, "size", size)
 

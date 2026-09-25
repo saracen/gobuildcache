@@ -256,7 +256,7 @@ func TestServe_RoundTrip(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		err := serve(ctx, underlying, dir, false, inR, outW)
+		err := serve(ctx, underlying, options{cacheDir: dir}, inR, outW)
 		outW.Close()
 		done <- err
 	}()
@@ -341,7 +341,7 @@ func TestServe_Readonly_OmitsPut(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		err := serve(ctx, underlying, dir, true, inR, outW)
+		err := serve(ctx, underlying, options{cacheDir: dir, readonly: true}, inR, outW)
 		outW.Close()
 		done <- err
 	}()
@@ -379,7 +379,7 @@ func TestServe_BodySizeMismatch(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		err := serve(ctx, underlying, dir, false, inR, outW)
+		err := serve(ctx, underlying, options{cacheDir: dir}, inR, outW)
 		outW.Close()
 		done <- err
 	}()
@@ -430,7 +430,7 @@ func TestServe_ObjectIDFallback(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		err := serve(ctx, underlying, dir, false, inR, outW)
+		err := serve(ctx, underlying, options{cacheDir: dir}, inR, outW)
 		outW.Close()
 		done <- err
 	}()
