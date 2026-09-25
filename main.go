@@ -154,7 +154,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 	cacher := &Cacher{
 		disk: &Disk{cacheDir: opts.cacheDir},
 	}
-	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket}
+	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly}
 	cacher.bucket.Start(ctx)
 
 	// The go command sends close before closing stdin, which waits for
@@ -174,10 +174,11 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		return fmt.Errorf("creating cache output dir: %w", err)
 	}
 
-	caps := []cmd{cmdClose, cmdGet}
-	if !opts.readonly {
-		caps = append(caps, cmdPut)
-	}
+	// Puts are accepted even when readonly, and only kept locally: the go
+	// command reads back some of what it puts within the same invocation,
+	// such as the generated test main of a test package, and fails if the
+	// cache doesn't have it.
+	caps := []cmd{cmdClose, cmdGet, cmdPut}
 
 	r, w := bufio.NewReader(in), bufio.NewWriter(out)
 	dec, enc := json.NewDecoder(r), json.NewEncoder(w)
@@ -190,6 +191,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 	}
 
 	var mu sync.Mutex
+
 	for {
 		var req request
 		if err := dec.Decode(&req); err != nil {
@@ -313,7 +315,7 @@ func main() {
 
 	flag.StringVar(&prefix, "p", "", "prefix")
 	flag.BoolVar(&verbose, "v", false, "verbose")
-	flag.BoolVar(&opts.readonly, "readonly", false, "readonly")
+	flag.BoolVar(&opts.readonly, "readonly", false, "never write to the bucket, only to the local cache")
 	flag.BoolVar(&opts.stats, "stats", false, "log hit/miss and transfer statistics on exit")
 	flag.StringVar(&opts.cacheDir, "dir", "", "local cache directory (default: <user cache dir>/.gocachebucket)")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")

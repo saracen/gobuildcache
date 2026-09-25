@@ -78,6 +78,9 @@ type Bucket struct {
 	stats  Stats
 	remote breaker
 
+	// readonly keeps puts local, never uploading them.
+	readonly bool
+
 	closeOnce sync.Once
 }
 
@@ -270,7 +273,7 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 
 func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
 	exists, err := b.disk.LinkActionToOutput(ctx, actionID, outputID)
-	if err != nil || exists {
+	if err != nil || exists || b.readonly {
 		return exists, err
 	}
 

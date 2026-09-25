@@ -14,7 +14,7 @@ go install github.com/saracen/gobuildcache@latest
 export GOCACHEPROG="gobuildcache <bucket url>"
 ```
 
-A readonly mode is supported, which works well if `?anonymous=true` is also passed as a bucket parameter to the bucket URL if the bucket is publically accessible. This parameter seems to only be supported by GCS and S3 though.
+A readonly mode is supported, which never writes to the bucket. New cache entries are still kept in the local cache, because the go command reads some of them back within the same command. It works well with `?anonymous=true` passed as a bucket parameter if the bucket is publicly accessible, though this parameter seems to only be supported by GCS and S3.
 
 For more information on supported bucket URL parameters see https://gocloud.dev/howto/blob/#services.
 
@@ -22,7 +22,7 @@ For more information on supported bucket URL parameters see https://gocloud.dev/
 
 - `-v` for verbose logging.
 - `-p` to specify key prefix.
-- `-readonly` to only support fetching of cache items.
+- `-readonly` to never write to the bucket.
 - `-stats` to log a summary of hits, misses and transfers when the process exits.
 - `-dir` to specify the local cache directory (default `<user cache dir>/.gocachebucket`).
 - `-env` to remap an environment variable before opening the bucket, for example `-env GOOGLE_APPLICATION_CREDENTIALS=MY_CREDENTIALS_FILE`.

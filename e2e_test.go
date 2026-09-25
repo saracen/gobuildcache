@@ -104,6 +104,21 @@ func TestEndToEnd(t *testing.T) {
 	if got := strings.Count(out, "(cached)"); got != 2 {
 		t.Errorf("want 2 cached test results, got %d:\n%s", got, out)
 	}
+
+	// Listing a test package's compiled files writes its generated test main
+	// to the cache and reads it back, which needs puts even when readonly.
+	cmd := exec.Command(goBin, "list", "-e", "-test", "-compiled", "-f", "{{if .Error}}{{.ImportPath}}: {{.Error}}{{end}}", "./...")
+	cmd.Dir = mod
+	cmd.Env = append(os.Environ(),
+		"GOCACHEPROG="+strings.Join([]string{bin, "-readonly", "-dir", filepath.Join(tmp, "lister"), bucketURL}, " "),
+		"GOCACHE="+filepath.Join(tmp, "lister-gocache"),
+		"GOFLAGS=",
+		"GOWORK=off",
+		"GOTOOLCHAIN=local",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "" {
+		t.Errorf("go list -test -compiled with -readonly: %v\n%s", err, out)
+	}
 }
 
 var statsLine = regexp.MustCompile(`msg="gobuildcache stats"(.*)`)
