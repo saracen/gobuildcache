@@ -192,6 +192,11 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 
 	var mu sync.Mutex
 
+	// wait for in-flight requests before returning, so their responses and
+	// any queued uploads aren't lost
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
+
 	for {
 		var req request
 		if err := dec.Decode(&req); err != nil {
@@ -221,7 +226,10 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 			}
 		}
 
+		inflight.Add(1)
 		go func() {
+			defer inflight.Done()
+
 			resp := handleRequest(ctx, cacher, &req)
 			mu.Lock()
 			enc.Encode(resp)
