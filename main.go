@@ -137,15 +137,20 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 	defer bucket.Close()
 	bucket = blob.PrefixedBucket(bucket, prefix)
 
-	cacher := &Cacher{}
-	cacher.disk = &Disk{cacheDir: filepath.Join(cacheDir, ".gocachebucket")}
+	return serve(ctx, bucket, filepath.Join(cacheDir, ".gocachebucket"), readonly, os.Stdin, originalStdout)
+}
+
+func serve(ctx context.Context, bucket *blob.Bucket, cacheDir string, readonly bool, in io.Reader, out io.Writer) error {
+	cacher := &Cacher{
+		disk: &Disk{cacheDir: cacheDir},
+	}
 	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket}
 	cacher.bucket.Start(ctx)
 
-	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, actionDir), 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, actionDir), 0o755); err != nil {
 		return fmt.Errorf("creating cache action dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, outputDir), 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, outputDir), 0o755); err != nil {
 		return fmt.Errorf("creating cache output dir: %w", err)
 	}
 
@@ -154,10 +159,12 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 		caps = append(caps, cmdPut)
 	}
 
-	r, w := bufio.NewReader(os.Stdin), bufio.NewWriter(originalStdout)
+	r, w := bufio.NewReader(in), bufio.NewWriter(out)
 	dec, enc := json.NewDecoder(r), json.NewEncoder(w)
 
-	enc.Encode(response{KnownCommands: caps})
+	if err := enc.Encode(response{KnownCommands: caps}); err != nil {
+		return err
+	}
 	if err := w.Flush(); err != nil {
 		return err
 	}
@@ -193,69 +200,70 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 		}
 
 		go func() {
-			resp := &response{ID: req.ID}
-
-			defer func() {
-				// Only stat and populate response fields if we have a valid
-				// DiskPath. On cache miss, DiskPath is empty and we should not
-				// attempt to stat it (which would fail and incorrectly set Err).
-				if req.Command != cmdClose && resp.DiskPath != "" {
-					fi, err := os.Stat(resp.DiskPath)
-					if err != nil {
-						resp.Err = err.Error()
-					} else {
-						resp.OutputID, err = hex.DecodeString(filepath.Base(resp.DiskPath))
-						if err != nil {
-							resp.Err = "invalid output id"
-						}
-						resp.Size = fi.Size()
-						modTime := fi.ModTime()
-						resp.Time = &modTime
-					}
-				}
-
-				mu.Lock()
-				enc.Encode(resp)
-				w.Flush()
-				mu.Unlock()
-			}()
-
-			var err error
-			switch req.Command {
-			case cmdClose:
-				cacher.bucket.Close()
-
-			case cmdGet:
-				now := time.Now()
-				resp.DiskPath, err = cacher.Get(ctx, &req)
-				if err != nil {
-					slog.Error("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
-				} else {
-					slog.Debug("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
-				}
-
-				if err != nil {
-					resp.Err = err.Error()
-				}
-				if resp.DiskPath == "" {
-					resp.Miss = true
-				}
-
-			case cmdPut:
-				now := time.Now()
-				resp.DiskPath, err = cacher.Put(ctx, &req)
-				if err != nil {
-					slog.Error("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
-				} else {
-					slog.Debug("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
-				}
-
-				if err != nil {
-					resp.Err = err.Error()
-				}
-			}
+			resp := handleRequest(ctx, cacher, &req)
+			mu.Lock()
+			enc.Encode(resp)
+			w.Flush()
+			mu.Unlock()
 		}()
 	}
+}
+
+func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
+	resp := &response{ID: req.ID}
+
+	var err error
+	switch req.Command {
+	case cmdClose:
+		c.bucket.Close()
+
+	case cmdGet:
+		now := time.Now()
+		resp.DiskPath, err = c.Get(ctx, req)
+		if err != nil {
+			slog.Error("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
+			resp.Err = err.Error()
+		} else {
+			slog.Debug("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
+		}
+		if resp.DiskPath == "" {
+			resp.Miss = true
+		}
+
+	case cmdPut:
+		now := time.Now()
+		resp.DiskPath, err = c.Put(ctx, req)
+		if err != nil {
+			slog.Error("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
+			resp.Err = err.Error()
+		} else {
+			slog.Debug("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "took", time.Since(now))
+		}
+	}
+
+	populateFileInfo(req, resp)
+	return resp
+}
+
+// populateFileInfo fills Size/Time/OutputID from the on-disk artifact named by
+// resp.DiskPath. Skipped for cmdClose (no disk path) and on cache miss
+// (empty DiskPath would otherwise produce a spurious stat error).
+func populateFileInfo(req *request, resp *response) {
+	if req.Command == cmdClose || resp.DiskPath == "" {
+		return
+	}
+	fi, err := os.Stat(resp.DiskPath)
+	if err != nil {
+		resp.Err = err.Error()
+		return
+	}
+	resp.OutputID, err = hex.DecodeString(filepath.Base(resp.DiskPath))
+	if err != nil {
+		resp.Err = "invalid output id"
+	}
+	resp.Size = fi.Size()
+	modTime := fi.ModTime()
+	resp.Time = &modTime
 }
 
 var originalStdout = os.Stdout

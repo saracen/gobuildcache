@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +23,29 @@ import (
 const (
 	actionDir = "action"
 	outputDir = "output"
+
+	// How long a recorded "this action has no output in the bucket" marker
+	// suppresses re-checking. Long enough to prevent hammering during a single
+	// build, short enough that a freshly-uploaded entry becomes visible soon.
+	emptyMarkerTTL = 10 * time.Minute
 )
+
+// isValidID reports whether s is safe to use as a cache ID embedded in a
+// filesystem path. IDs we generate are lowercase hex from hex.EncodeToString;
+// values arriving from untrusted sources (bucket metadata, on-disk symlink
+// targets) must be rejected before they can drive path traversal.
+func isValidID(s string) bool {
+	if len(s) == 0 || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
 
 type OutputInfo struct {
 	ID   string
@@ -47,6 +71,8 @@ type Bucket struct {
 	bucket *blob.Bucket
 	jobs   chan string
 	wg     sync.WaitGroup
+
+	closeOnce sync.Once
 }
 
 func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
@@ -63,7 +89,7 @@ func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (str
 	if err != nil {
 		return "", false, fmt.Errorf("creating temporary output file: %w", err)
 	}
-	defer os.RemoveAll(f.Name())
+	defer os.Remove(f.Name())
 	defer f.Close()
 
 	_, err = io.Copy(f, r)
@@ -97,7 +123,11 @@ func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string,
 		return "", err
 	}
 
-	return filepath.Base(outputPathname), nil
+	outputID := filepath.Base(outputPathname)
+	if !isValidID(outputID) {
+		return "", fmt.Errorf("invalid output id %q in action symlink %s", outputID, actionPathname)
+	}
+	return outputID, nil
 }
 
 func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
@@ -141,16 +171,21 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	// The downside is that if at some point it does exist in remote storage, we might not
 	// immediately observe that.
 	cacheEmptyOutputPath := filepath.Join(b.disk.cacheDir, actionDir, actionID+".empty")
-	if _, err := os.Stat(cacheEmptyOutputPath); err == nil {
-		slog.Debug("empty found", "action", actionID, "output", outputID)
-		return "", nil
+	if fi, err := os.Stat(cacheEmptyOutputPath); err == nil {
+		if time.Since(fi.ModTime()) < emptyMarkerTTL {
+			slog.Debug("empty found", "action", actionID, "output", outputID)
+			return "", nil
+		}
+		slog.Debug("empty marker expired", "action", actionID)
 	}
 
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
 	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		slog.Debug("created found", "action", actionID, "output", outputID)
-		os.WriteFile(cacheEmptyOutputPath, nil, 0o600)
+		if err := os.WriteFile(cacheEmptyOutputPath, nil, 0o600); err != nil {
+			slog.Warn("writing empty marker", "action", actionID, "err", err)
+		}
 		return "", nil
 	}
 	if err != nil {
@@ -162,9 +197,14 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		slog.Debug("no metadata output id", "action", actionID, "output", outputID)
 		return "", nil
 	}
+	if !isValidID(outputID) {
+		return "", fmt.Errorf("invalid output_id %q in bucket metadata for action %s", outputID, actionID)
+	}
 
 	slog.Debug("linking action to output from output from action", "action", actionID, "output", outputID)
-	b.disk.LinkActionToOutput(ctx, actionID, outputID)
+	if _, err := b.disk.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		slog.Warn("linking action to output", "action", actionID, "output", outputID, "err", err)
+	}
 
 	return outputID, nil
 }
@@ -177,7 +217,7 @@ func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID stri
 
 	return false, b.bucket.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
 		Metadata:    map[string]string{"output_id": outputID},
-		ContentType: "plain/text",
+		ContentType: "text/plain",
 	})
 }
 
@@ -191,9 +231,24 @@ func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (s
 	}
 
 	slog.Debug("scheduling upload", "path", pathname)
-	b.jobs <- pathname
+	if err := b.enqueueUpload(pathname); err != nil {
+		return pathname, false, err
+	}
 
 	return pathname, false, nil
+}
+
+// enqueueUpload sends to the job channel, recovering if a concurrent Close
+// has shut it down. A protocol-conformant driver issues no puts after close,
+// but a malformed one would otherwise panic the process.
+func (b *Bucket) enqueueUpload(pathname string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("upload queue closed: %v", r)
+		}
+	}()
+	b.jobs <- pathname
+	return nil
 }
 
 func (b *Bucket) Start(ctx context.Context) {
@@ -201,7 +256,7 @@ func (b *Bucket) Start(ctx context.Context) {
 	b.jobs = make(chan string, 1000)
 
 	// 20 workers ought to be enough for anybody
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		b.wg.Add(1)
 		go func() {
 			defer b.wg.Done()
@@ -227,13 +282,15 @@ func (b *Bucket) Start(ctx context.Context) {
 }
 
 func (b *Bucket) Close() {
-	slog.Debug("waiting for uploads...")
+	b.closeOnce.Do(func() {
+		slog.Debug("waiting for uploads...")
 
-	now := time.Now()
-	close(b.jobs)
-	b.wg.Wait()
+		now := time.Now()
+		close(b.jobs)
+		b.wg.Wait()
 
-	slog.Debug("waited for uploads", "took", time.Since(now))
+		slog.Debug("waited for uploads", "took", time.Since(now))
+	})
 }
 
 func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error) {
@@ -254,21 +311,49 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 
 	slog.Debug("downloading", "output", outputID)
 
-	buf := new(bytes.Buffer)
-	err = b.bucket.Download(ctx, path.Join(outputDir, outputID), buf, &blob.ReaderOptions{})
-	slog.Debug("downloaded", "output", outputID, "err", err)
+	rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	defer rdr.Close()
 
-	slog.Debug("putting download to disk", "output", outputID, "size", buf.Len())
+	f, err := os.CreateTemp(b.disk.cacheDir, "output")
+	if err != nil {
+		return "", fmt.Errorf("creating temporary output file: %w", err)
+	}
+	keep := false
+	defer func() {
+		f.Close()
+		if !keep {
+			os.Remove(f.Name())
+		}
+	}()
 
-	pathname, _, err = b.disk.PutOutput(ctx, outputID, bytes.NewReader(buf.Bytes()))
+	// outputID is the SHA256 of the cached content (per Go's cache protocol).
+	// Hash while streaming so a poisoned bucket can't feed mismatched bytes
+	// into the build.
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(f, h), rdr)
+	if err != nil {
+		return "", fmt.Errorf("downloading output: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("flushing output: %w", err)
+	}
 
-	slog.Debug("putting download to disk done", "output", outputID, "size", buf.Len())
+	if got := hex.EncodeToString(h.Sum(nil)); got != outputID {
+		return "", fmt.Errorf("output %s hash mismatch: got %s", outputID, got)
+	}
 
-	return pathname, err
+	if err := os.Rename(f.Name(), pathname); err != nil {
+		return "", fmt.Errorf("renaming output: %w", err)
+	}
+	keep = true
+
+	slog.Debug("downloaded to disk", "output", outputID, "size", size)
+
+	return pathname, nil
 }

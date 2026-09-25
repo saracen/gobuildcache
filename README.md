@@ -2,10 +2,16 @@
 
 `gobuildcache` is a [`GOCACHEPROG`](https://github.com/golang/go/issues/59719) process using the [The Go Cloud Development Kit](https://gocloud.dev/) to support Azure, GCS and S3 storage providers.
 
+## install
+
+```shell
+go install github.com/saracen/gobuildcache@latest
+```
+
 ## usage
 
 ```shell
-export GOCACHEPROG="./gobuildcache <bucket url>"
+export GOCACHEPROG="gobuildcache <bucket url>"
 ```
 
 A readonly mode is supported, which works well if `?anonymous=true` is also passed as a bucket parameter to the bucket URL if the bucket is publically accessible. This parameter seems to only be supported by GCS and S3 though.
