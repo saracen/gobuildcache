@@ -224,3 +224,46 @@ func TestGCS_PersistentReadFailuresReturn(t *testing.T) {
 		t.Fatal("lookup didn't return")
 	}
 }
+
+func TestWithRetry_RecordsTiming(t *testing.T) {
+	fastRetries(t, time.Second)
+	b := &Bucket{}
+
+	release := make(chan struct{})
+	done := make(chan struct{})
+	for range 3 {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			b.withRetry(context.Background(), time.Second, func(context.Context) error {
+				<-release
+				time.Sleep(20 * time.Millisecond)
+				return nil
+			})
+		}()
+	}
+
+	// wait until all three are in flight together
+	for b.stats.remoteInFlight.Load() < 3 {
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	for range 3 {
+		<-done
+	}
+
+	if got := b.stats.RemoteCalls.Load(); got != 3 {
+		t.Errorf("remote calls = %d, want 3", got)
+	}
+	if got := b.stats.RemotePeakInFlight.Load(); got != 3 {
+		t.Errorf("peak in flight = %d, want 3", got)
+	}
+	if got := b.stats.RemoteWaitMillis.Load(); got < 60 {
+		t.Errorf("remote wait = %dms, want at least 60ms", got)
+	}
+	if got := b.stats.RemoteSlowestMillis.Load(); got < 20 {
+		t.Errorf("slowest = %dms, want at least 20ms", got)
+	}
+	if got := b.stats.remoteInFlight.Load(); got != 0 {
+		t.Errorf("in flight after = %d, want 0", got)
+	}
+}
