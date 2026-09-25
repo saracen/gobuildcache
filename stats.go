@@ -27,6 +27,12 @@ type Stats struct {
 	UploadBytes    atomic.Int64
 	UploadsSkipped atomic.Int64
 	UploadErrors   atomic.Int64
+
+	// Refreshes counts objects refreshed by copying them onto themselves;
+	// RefreshUploads those that were uploaded again instead.
+	Refreshes      atomic.Int64
+	RefreshUploads atomic.Int64
+	RefreshErrors  atomic.Int64
 }
 
 func (s *Stats) Log() {
@@ -45,5 +51,8 @@ func (s *Stats) Log() {
 		"upload_bytes", s.UploadBytes.Load(),
 		"uploads_skipped", s.UploadsSkipped.Load(),
 		"upload_errors", s.UploadErrors.Load(),
+		"refreshes", s.Refreshes.Load(),
+		"refresh_uploads", s.RefreshUploads.Load(),
+		"refresh_errors", s.RefreshErrors.Load(),
 	)
 }

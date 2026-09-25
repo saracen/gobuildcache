@@ -125,9 +125,10 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 }
 
 type options struct {
-	cacheDir string
-	readonly bool
-	stats    bool
+	cacheDir     string
+	readonly     bool
+	stats        bool
+	refreshAfter time.Duration
 }
 
 func defaultCacheDir() (string, error) {
@@ -154,7 +155,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 	cacher := &Cacher{
 		disk: &Disk{cacheDir: opts.cacheDir},
 	}
-	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly}
+	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly, refreshAfter: opts.refreshAfter}
 	cacher.bucket.Start(ctx)
 
 	// The go command sends close before closing stdin, which waits for
@@ -325,6 +326,7 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "verbose")
 	flag.BoolVar(&opts.readonly, "readonly", false, "never write to the bucket, only to the local cache")
 	flag.BoolVar(&opts.stats, "stats", false, "log hit/miss and transfer statistics on exit")
+	flag.DurationVar(&opts.refreshAfter, "refresh-after", 24*time.Hour, "rewrite objects older than this when using them, to restart their expiry (0 disables)")
 	flag.StringVar(&opts.cacheDir, "dir", "", "local cache directory (default: <user cache dir>/.gocachebucket)")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {
