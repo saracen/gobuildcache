@@ -69,10 +69,28 @@ type Disk struct {
 type Bucket struct {
 	disk   *Disk
 	bucket *blob.Bucket
-	jobs   chan string
+	jobs   chan uploadJob
 	wg     sync.WaitGroup
 
+	// outputs deduplicates output uploads within this process, so that an
+	// action link is only ever published after its output is in the bucket.
+	outputs sync.Map // outputID -> *outputUpload
+
 	closeOnce sync.Once
+}
+
+// uploadJob publishes an action link to the bucket once the output it points
+// to has been uploaded. Publishing the link first would let another process
+// observe an action whose output doesn't exist yet (or never will, if the
+// upload fails), turning a would-be hit into a wasted lookup and a miss.
+type uploadJob struct {
+	actionID string
+	outputID string
+}
+
+type outputUpload struct {
+	once sync.Once
+	err  error
 }
 
 func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
@@ -215,45 +233,79 @@ func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID stri
 		return exists, err
 	}
 
-	return false, b.bucket.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
-		Metadata:    map[string]string{"output_id": outputID},
-		ContentType: "text/plain",
-	})
+	slog.Debug("scheduling upload", "action", actionID, "output", outputID)
+	if err := b.enqueueUpload(uploadJob{actionID: actionID, outputID: outputID}); err != nil {
+		return false, err
+	}
+
+	return false, nil
 }
 
 func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
-	pathname, exists, err := b.disk.PutOutput(ctx, outputID, r)
-	if err != nil {
-		return "", false, err
-	}
-	if exists {
-		return pathname, true, nil
-	}
-
-	slog.Debug("scheduling upload", "path", pathname)
-	if err := b.enqueueUpload(pathname); err != nil {
-		return pathname, false, err
-	}
-
-	return pathname, false, nil
+	return b.disk.PutOutput(ctx, outputID, r)
 }
 
 // enqueueUpload sends to the job channel, recovering if a concurrent Close
 // has shut it down. A protocol-conformant driver issues no puts after close,
 // but a malformed one would otherwise panic the process.
-func (b *Bucket) enqueueUpload(pathname string) (err error) {
+func (b *Bucket) enqueueUpload(job uploadJob) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("upload queue closed: %v", r)
 		}
 	}()
-	b.jobs <- pathname
+	b.jobs <- job
 	return nil
+}
+
+func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
+	v, _ := b.outputs.LoadOrStore(job.outputID, &outputUpload{})
+	u := v.(*outputUpload)
+	u.once.Do(func() {
+		u.err = b.uploadOutput(ctx, job.outputID)
+	})
+	if u.err != nil {
+		return fmt.Errorf("uploading output %s: %w", job.outputID, u.err)
+	}
+
+	err := b.bucket.Upload(ctx, path.Join(actionDir, job.actionID), bytes.NewReader(nil), &blob.WriterOptions{
+		Metadata:    map[string]string{"output_id": job.outputID},
+		ContentType: "text/plain",
+	})
+	if err != nil {
+		return fmt.Errorf("uploading action %s: %w", job.actionID, err)
+	}
+
+	return nil
+}
+
+func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
+	key := path.Join(outputDir, outputID)
+
+	// Outputs are content addressed, so if it's already there it's identical.
+	// Writers mostly produce outputs that another job has already uploaded;
+	// checking first is a lot cheaper than uploading it again.
+	exists, err := b.bucket.Exists(ctx, key)
+	if err != nil {
+		slog.Debug("checking output exists", "output", outputID, "err", err)
+	}
+	if exists {
+		slog.Debug("output already uploaded", "output", outputID)
+		return nil
+	}
+
+	f, err := os.Open(filepath.Join(b.disk.cacheDir, outputDir, outputID))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return b.bucket.Upload(ctx, key, f, &blob.WriterOptions{ContentType: "application/octet-stream"})
 }
 
 func (b *Bucket) Start(ctx context.Context) {
 	// queue up to 1000
-	b.jobs = make(chan string, 1000)
+	b.jobs = make(chan uploadJob, 1000)
 
 	// 20 workers ought to be enough for anybody
 	for range 20 {
@@ -261,20 +313,12 @@ func (b *Bucket) Start(ctx context.Context) {
 		go func() {
 			defer b.wg.Done()
 
-			for pathname := range b.jobs {
-				f, err := os.Open(pathname)
-				if err != nil {
-					slog.Error("opening file for upload", "path", pathname, "err", err)
-					continue
-				}
-
+			for job := range b.jobs {
 				now := time.Now()
-				err = b.bucket.Upload(ctx, path.Join(outputDir, filepath.Base(pathname)), f, &blob.WriterOptions{ContentType: "application/octet-stream"})
-				f.Close()
-				if err != nil {
-					slog.Error("uploading file", "path", pathname, "err", err, "took", time.Since(now))
+				if err := b.upload(ctx, job); err != nil {
+					slog.Error("upload", "action", job.actionID, "output", job.outputID, "err", err, "took", time.Since(now))
 				} else {
-					slog.Debug("uploaded file", "path", pathname, "took", time.Since(now))
+					slog.Debug("uploaded", "action", job.actionID, "output", job.outputID, "took", time.Since(now))
 				}
 			}
 		}()
