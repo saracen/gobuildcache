@@ -75,7 +75,8 @@ type Bucket struct {
 	// action link is only ever published after its output is in the bucket.
 	outputs sync.Map // outputID -> *outputUpload
 
-	stats Stats
+	stats  Stats
+	remote breaker
 
 	closeOnce sync.Once
 }
@@ -231,8 +232,13 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		slog.Debug("empty marker expired", "action", actionID)
 	}
 
+	if !b.remote.allow() {
+		return "", nil
+	}
+
 	b.stats.RemoteLookups.Add(1)
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
+	b.remote.record(err)
 	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		slog.Debug("created found", "action", actionID, "output", outputID)
@@ -296,6 +302,11 @@ func (b *Bucket) enqueueUpload(job uploadJob) (err error) {
 func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 	v, _ := b.outputs.LoadOrStore(job.outputID, &outputUpload{})
 	u := v.(*outputUpload)
+	if !b.remote.allow() {
+		b.stats.UploadsSkipped.Add(1)
+		return nil
+	}
+
 	u.once.Do(func() {
 		u.err = b.uploadOutput(ctx, job.outputID)
 	})
@@ -307,6 +318,7 @@ func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 		Metadata:    map[string]string{"output_id": job.outputID},
 		ContentType: "text/plain",
 	})
+	b.remote.record(err)
 	if err != nil {
 		return fmt.Errorf("uploading action %s: %w", job.actionID, err)
 	}
@@ -337,7 +349,9 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	defer f.Close()
 
 	n := &countingReader{r: f}
-	if err := b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"}); err != nil {
+	err = b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"})
+	b.remote.record(err)
+	if err != nil {
 		return err
 	}
 
@@ -409,9 +423,14 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return pathname, nil
 	}
 
+	if !b.remote.allow() {
+		return "", nil
+	}
+
 	slog.Debug("downloading", "output", outputID)
 
 	rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
+	b.remote.record(err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}

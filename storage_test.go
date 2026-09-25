@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -664,5 +665,77 @@ func TestDiskOutputIDFromAction_RejectsInvalidFile(t *testing.T) {
 	}
 	if _, err := d.OutputIDFromAction(context.Background(), actionID); err == nil {
 		t.Error("expected error for invalid link contents")
+	}
+}
+
+func TestBucket_BreakerStopsUsingFailingBucket(t *testing.T) {
+	ctx := context.Background()
+	d := newDisk(t)
+
+	// Every operation on a closed bucket fails, like a bucket with bad
+	// credentials would.
+	underlying := memblob.OpenBucket(nil)
+	underlying.Close()
+
+	b := &Bucket{disk: d, bucket: underlying}
+	b.Start(ctx)
+	t.Cleanup(b.Close)
+
+	for i := range maxConsecutiveFailures + 3 {
+		_, err := b.OutputIDFromAction(ctx, fmt.Sprintf("%064x", i))
+		if i < maxConsecutiveFailures && err == nil {
+			t.Fatalf("lookup %d: expected error from failing bucket", i)
+		}
+		if i >= maxConsecutiveFailures && err != nil {
+			t.Fatalf("lookup %d: expected a miss once disabled, got %v", i, err)
+		}
+	}
+
+	if got := b.stats.RemoteLookups.Load(); got != maxConsecutiveFailures {
+		t.Errorf("remote lookups = %d, want %d", got, maxConsecutiveFailures)
+	}
+
+	// Puts still work locally, and no upload is attempted.
+	content := []byte("local only")
+	outputID := hashID(content)
+	actionID := strings.Repeat("a", 64)
+	if _, _, err := b.PutOutput(ctx, outputID, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+
+	if got, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
+		t.Errorf("local lookup = %q, %v; want %q", got, err, outputID)
+	}
+	if got := b.stats.UploadErrors.Load(); got != 0 {
+		t.Errorf("upload errors = %d, want 0", got)
+	}
+}
+
+func TestBreaker_ResetsOnSuccess(t *testing.T) {
+	underlying := memblob.OpenBucket(nil)
+	underlying.Close()
+	_, failure := underlying.Attributes(context.Background(), "x")
+	if failure == nil {
+		t.Fatal("expected closed bucket to fail")
+	}
+
+	var br breaker
+	for range maxConsecutiveFailures - 1 {
+		br.record(failure)
+	}
+	br.record(nil)
+	for range maxConsecutiveFailures - 1 {
+		br.record(failure)
+	}
+	if !br.allow() {
+		t.Error("breaker tripped without consecutive failures")
+	}
+	br.record(failure)
+	if br.allow() {
+		t.Error("breaker didn't trip")
 	}
 }
