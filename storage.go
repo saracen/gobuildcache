@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 )
@@ -269,6 +270,31 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	}
 
 	return outputID, nil
+}
+
+// setGCSUploadRetry makes the GCS client retry object writes.
+//
+// Reads are idempotent, so the client already retries those. An unconditional
+// write is not, so under the default RetryIdempotent policy a single transient
+// error, such as a 503, fails the upload. For an action marker that loses the
+// link to its output; for an output it loses the object.
+//
+// RetryAlways is safe for what this uploads. Outputs are named by their
+// content, and a retry of an action marker resends the same empty body and
+// metadata, so writing either one twice is the same as writing it once.
+//
+// The client retries a write, like a read, until the context ends. Nothing
+// here bounds that.
+//
+// Only GCS needs this. The AWS and Azure SDKs retry on their own, and a bucket
+// backed by anything else leaves As unsatisfied and is left alone.
+func setGCSUploadRetry(bucket *blob.Bucket) {
+	var client *storage.Client
+	if !bucket.As(&client) {
+		return
+	}
+
+	client.SetRetry(storage.WithPolicy(storage.RetryAlways))
 }
 
 func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {

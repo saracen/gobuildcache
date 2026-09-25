@@ -145,6 +145,7 @@ func run(ctx context.Context, prefix, bucketURL string, opts options) error {
 		return fmt.Errorf("opening bucket: %w", err)
 	}
 	defer bucket.Close()
+	setGCSUploadRetry(bucket)
 	bucket = blob.PrefixedBucket(bucket, prefix)
 
 	return serve(ctx, bucket, opts, os.Stdin, originalStdout)
