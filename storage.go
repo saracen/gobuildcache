@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -69,10 +68,34 @@ type Disk struct {
 type Bucket struct {
 	disk   *Disk
 	bucket *blob.Bucket
-	jobs   chan string
+	jobs   chan uploadJob
 	wg     sync.WaitGroup
 
+	// outputs deduplicates output uploads within this process, so that an
+	// action link is only ever published after its output is in the bucket.
+	outputs sync.Map // outputID -> *outputUpload
+
+	stats  Stats
+	remote breaker
+
+	// readonly keeps puts local, never uploading them.
+	readonly bool
+
 	closeOnce sync.Once
+}
+
+// uploadJob publishes an action link to the bucket once the output it points
+// to has been uploaded. Publishing the link first would let another process
+// observe an action whose output doesn't exist yet (or never will, if the
+// upload fails), turning a would-be hit into a wasted lookup and a miss.
+type uploadJob struct {
+	actionID string
+	outputID string
+}
+
+type outputUpload struct {
+	once sync.Once
+	err  error
 }
 
 func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
@@ -115,7 +138,7 @@ func (d *Disk) GetOutput(ctx context.Context, outputID string) (string, error) {
 func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
 
-	outputPathname, err := os.Readlink(actionPathname)
+	outputID, err := readActionLink(actionPathname)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
@@ -123,32 +146,65 @@ func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string,
 		return "", err
 	}
 
-	outputID := filepath.Base(outputPathname)
 	if !isValidID(outputID) {
-		return "", fmt.Errorf("invalid output id %q in action symlink %s", outputID, actionPathname)
+		return "", fmt.Errorf("invalid output id %q in action link %s", outputID, actionPathname)
 	}
 	return outputID, nil
 }
 
+// readActionLink returns the output ID an action link refers to. Links are
+// files containing the output ID; older versions used symlinks to the output,
+// which aren't reliably available on Windows.
+func readActionLink(pathname string) (string, error) {
+	fi, err := os.Lstat(pathname)
+	if err != nil {
+		return "", err
+	}
+
+	if fi.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(pathname)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Base(target), nil
+	}
+
+	data, err := os.ReadFile(pathname)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes.TrimSpace(data)), nil
+}
+
 func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
-	outputPathname := filepath.Join("..", outputDir, outputID)
 
-	// Check if existing symlink already points to the correct output
-	existing, err := os.Readlink(actionPathname)
-	if err == nil && existing == outputPathname {
+	if existing, err := readActionLink(actionPathname); err == nil && existing == outputID {
 		return true, nil
 	}
 
-	// Atomically create/replace symlink by creating at temp path then renaming
-	tmpPathname := fmt.Sprintf("%s.tmp.%x", actionPathname, rand.Uint64())
-	// Conceivably the temporary filename could already exist and this would
-	// error, but it seems unlikely enough to not worry about.
-	if err := os.Symlink(outputPathname, tmpPathname); err != nil {
+	// Write to a temporary file and rename, so readers never see a partial link.
+	f, err := os.CreateTemp(filepath.Join(d.cacheDir, actionDir), actionID+".tmp.*")
+	if err != nil {
 		return false, err
 	}
-	if err := os.Rename(tmpPathname, actionPathname); err != nil {
-		os.Remove(tmpPathname)
+	defer os.Remove(f.Name())
+
+	_, err = f.WriteString(outputID)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return false, err
+	}
+
+	// A legacy symlink would be replaced by the rename on unix, but not on
+	// Windows, so remove it first.
+	if fi, err := os.Lstat(actionPathname); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		os.Remove(actionPathname)
+	}
+
+	if err := os.Rename(f.Name(), actionPathname); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -179,7 +235,13 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		slog.Debug("empty marker expired", "action", actionID)
 	}
 
+	if !b.remote.allow() {
+		return "", nil
+	}
+
+	b.stats.RemoteLookups.Add(1)
 	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
+	b.remote.record(err)
 	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		slog.Debug("created found", "action", actionID, "output", outputID)
@@ -211,49 +273,111 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 
 func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
 	exists, err := b.disk.LinkActionToOutput(ctx, actionID, outputID)
-	if err != nil || exists {
+	if err != nil || exists || b.readonly {
 		return exists, err
 	}
 
-	return false, b.bucket.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
-		Metadata:    map[string]string{"output_id": outputID},
-		ContentType: "text/plain",
-	})
+	slog.Debug("scheduling upload", "action", actionID, "output", outputID)
+	if err := b.enqueueUpload(uploadJob{actionID: actionID, outputID: outputID}); err != nil {
+		return false, err
+	}
+
+	return false, nil
 }
 
 func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
-	pathname, exists, err := b.disk.PutOutput(ctx, outputID, r)
-	if err != nil {
-		return "", false, err
-	}
-	if exists {
-		return pathname, true, nil
-	}
-
-	slog.Debug("scheduling upload", "path", pathname)
-	if err := b.enqueueUpload(pathname); err != nil {
-		return pathname, false, err
-	}
-
-	return pathname, false, nil
+	return b.disk.PutOutput(ctx, outputID, r)
 }
 
 // enqueueUpload sends to the job channel, recovering if a concurrent Close
 // has shut it down. A protocol-conformant driver issues no puts after close,
 // but a malformed one would otherwise panic the process.
-func (b *Bucket) enqueueUpload(pathname string) (err error) {
+func (b *Bucket) enqueueUpload(job uploadJob) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("upload queue closed: %v", r)
 		}
 	}()
-	b.jobs <- pathname
+	b.jobs <- job
 	return nil
+}
+
+func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
+	v, _ := b.outputs.LoadOrStore(job.outputID, &outputUpload{})
+	u := v.(*outputUpload)
+	if !b.remote.allow() {
+		b.stats.UploadsSkipped.Add(1)
+		return nil
+	}
+
+	u.once.Do(func() {
+		u.err = b.uploadOutput(ctx, job.outputID)
+	})
+	if u.err != nil {
+		return fmt.Errorf("uploading output %s: %w", job.outputID, u.err)
+	}
+
+	err := b.bucket.Upload(ctx, path.Join(actionDir, job.actionID), bytes.NewReader(nil), &blob.WriterOptions{
+		Metadata:    map[string]string{"output_id": job.outputID},
+		ContentType: "text/plain",
+	})
+	b.remote.record(err)
+	if err != nil {
+		return fmt.Errorf("uploading action %s: %w", job.actionID, err)
+	}
+
+	return nil
+}
+
+func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
+	key := path.Join(outputDir, outputID)
+
+	// Outputs are content addressed, so if it's already there it's identical.
+	// Writers mostly produce outputs that another job has already uploaded;
+	// checking first is a lot cheaper than uploading it again.
+	exists, err := b.bucket.Exists(ctx, key)
+	if err != nil {
+		slog.Debug("checking output exists", "output", outputID, "err", err)
+	}
+	if exists {
+		slog.Debug("output already uploaded", "output", outputID)
+		b.stats.UploadsSkipped.Add(1)
+		return nil
+	}
+
+	f, err := os.Open(filepath.Join(b.disk.cacheDir, outputDir, outputID))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	n := &countingReader{r: f}
+	err = b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"})
+	b.remote.record(err)
+	if err != nil {
+		return err
+	}
+
+	b.stats.Uploads.Add(1)
+	b.stats.UploadBytes.Add(n.n)
+
+	return nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func (b *Bucket) Start(ctx context.Context) {
 	// queue up to 1000
-	b.jobs = make(chan string, 1000)
+	b.jobs = make(chan uploadJob, 1000)
 
 	// 20 workers ought to be enough for anybody
 	for range 20 {
@@ -261,20 +385,13 @@ func (b *Bucket) Start(ctx context.Context) {
 		go func() {
 			defer b.wg.Done()
 
-			for pathname := range b.jobs {
-				f, err := os.Open(pathname)
-				if err != nil {
-					slog.Error("opening file for upload", "path", pathname, "err", err)
-					continue
-				}
-
+			for job := range b.jobs {
 				now := time.Now()
-				err = b.bucket.Upload(ctx, path.Join(outputDir, filepath.Base(pathname)), f, &blob.WriterOptions{ContentType: "application/octet-stream"})
-				f.Close()
-				if err != nil {
-					slog.Error("uploading file", "path", pathname, "err", err, "took", time.Since(now))
+				if err := b.upload(ctx, job); err != nil {
+					b.stats.UploadErrors.Add(1)
+					slog.Error("upload", "action", job.actionID, "output", job.outputID, "err", err, "took", time.Since(now))
 				} else {
-					slog.Debug("uploaded file", "path", pathname, "took", time.Since(now))
+					slog.Debug("uploaded", "action", job.actionID, "output", job.outputID, "took", time.Since(now))
 				}
 			}
 		}()
@@ -309,9 +426,14 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return pathname, nil
 	}
 
+	if !b.remote.allow() {
+		return "", nil
+	}
+
 	slog.Debug("downloading", "output", outputID)
 
 	rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
+	b.remote.record(err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}
@@ -352,6 +474,9 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return "", fmt.Errorf("renaming output: %w", err)
 	}
 	keep = true
+
+	b.stats.Downloads.Add(1)
+	b.stats.DownloadBytes.Add(size)
 
 	slog.Debug("downloaded to disk", "output", outputID, "size", size)
 

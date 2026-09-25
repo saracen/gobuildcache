@@ -124,12 +124,22 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	return pathname.(string), err
 }
 
-func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
+type options struct {
+	cacheDir string
+	readonly bool
+	stats    bool
+}
+
+func defaultCacheDir() (string, error) {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return fmt.Errorf("getting cache dir: %w", err)
+		return "", fmt.Errorf("getting cache dir: %w", err)
 	}
 
+	return filepath.Join(cacheDir, ".gocachebucket"), nil
+}
+
+func run(ctx context.Context, prefix, bucketURL string, opts options) error {
 	bucket, err := blob.OpenBucket(ctx, bucketURL)
 	if err != nil {
 		return fmt.Errorf("opening bucket: %w", err)
@@ -137,15 +147,25 @@ func run(ctx context.Context, prefix, bucketURL string, readonly bool) error {
 	defer bucket.Close()
 	bucket = blob.PrefixedBucket(bucket, prefix)
 
-	return serve(ctx, bucket, filepath.Join(cacheDir, ".gocachebucket"), readonly, os.Stdin, originalStdout)
+	return serve(ctx, bucket, opts, os.Stdin, originalStdout)
 }
 
-func serve(ctx context.Context, bucket *blob.Bucket, cacheDir string, readonly bool, in io.Reader, out io.Writer) error {
+func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader, out io.Writer) error {
 	cacher := &Cacher{
-		disk: &Disk{cacheDir: cacheDir},
+		disk: &Disk{cacheDir: opts.cacheDir},
 	}
-	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket}
+	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly}
 	cacher.bucket.Start(ctx)
+
+	// The go command sends close before closing stdin, which waits for
+	// uploads, but if stdin is closed without it we still want queued uploads
+	// to finish.
+	defer func() {
+		cacher.bucket.Close()
+		if opts.stats {
+			cacher.bucket.stats.Log()
+		}
+	}()
 
 	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, actionDir), 0o755); err != nil {
 		return fmt.Errorf("creating cache action dir: %w", err)
@@ -154,10 +174,11 @@ func serve(ctx context.Context, bucket *blob.Bucket, cacheDir string, readonly b
 		return fmt.Errorf("creating cache output dir: %w", err)
 	}
 
-	caps := []cmd{cmdClose, cmdGet}
-	if !readonly {
-		caps = append(caps, cmdPut)
-	}
+	// Puts are accepted even when readonly, and only kept locally: the go
+	// command reads back some of what it puts within the same invocation,
+	// such as the generated test main of a test package, and fails if the
+	// cache doesn't have it.
+	caps := []cmd{cmdClose, cmdGet, cmdPut}
 
 	r, w := bufio.NewReader(in), bufio.NewWriter(out)
 	dec, enc := json.NewDecoder(r), json.NewEncoder(w)
@@ -170,6 +191,12 @@ func serve(ctx context.Context, bucket *blob.Bucket, cacheDir string, readonly b
 	}
 
 	var mu sync.Mutex
+
+	// wait for in-flight requests before returning, so their responses and
+	// any queued uploads aren't lost
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
+
 	for {
 		var req request
 		if err := dec.Decode(&req); err != nil {
@@ -199,7 +226,10 @@ func serve(ctx context.Context, bucket *blob.Bucket, cacheDir string, readonly b
 			}
 		}
 
+		inflight.Add(1)
 		go func() {
+			defer inflight.Done()
+
 			resp := handleRequest(ctx, cacher, &req)
 			mu.Lock()
 			enc.Encode(resp)
@@ -218,8 +248,17 @@ func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
 		c.bucket.Close()
 
 	case cmdGet:
+		c.bucket.stats.Gets.Add(1)
 		now := time.Now()
 		resp.DiskPath, err = c.Get(ctx, req)
+		switch {
+		case err != nil:
+			c.bucket.stats.GetErrors.Add(1)
+		case resp.DiskPath == "":
+			c.bucket.stats.Misses.Add(1)
+		default:
+			c.bucket.stats.Hits.Add(1)
+		}
 		if err != nil {
 			slog.Error("get", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
 			resp.Err = err.Error()
@@ -231,9 +270,12 @@ func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
 		}
 
 	case cmdPut:
+		c.bucket.stats.Puts.Add(1)
+		c.bucket.stats.PutBytes.Add(req.BodySize)
 		now := time.Now()
 		resp.DiskPath, err = c.Put(ctx, req)
 		if err != nil {
+			c.bucket.stats.PutErrors.Add(1)
 			slog.Error("put", "action", hex.EncodeToString(req.ActionID), "output", resp.DiskPath, "err", err, "took", time.Since(now))
 			resp.Err = err.Error()
 		} else {
@@ -276,12 +318,14 @@ func init() {
 func main() {
 	var prefix string
 	var verbose bool
-	var readonly bool
+	var opts options
 	var envmap flagArray
 
 	flag.StringVar(&prefix, "p", "", "prefix")
 	flag.BoolVar(&verbose, "v", false, "verbose")
-	flag.BoolVar(&readonly, "readonly", false, "readonly")
+	flag.BoolVar(&opts.readonly, "readonly", false, "never write to the bucket, only to the local cache")
+	flag.BoolVar(&opts.stats, "stats", false, "log hit/miss and transfer statistics on exit")
+	flag.StringVar(&opts.cacheDir, "dir", "", "local cache directory (default: <user cache dir>/.gocachebucket)")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "%s <bucket url>\n", os.Args[0])
@@ -308,7 +352,16 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	if err := run(context.Background(), prefix, flag.Arg(0), readonly); err != nil {
+	if opts.cacheDir == "" {
+		var err error
+		opts.cacheDir, err = defaultCacheDir()
+		if err != nil {
+			slog.Error("run error", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	if err := run(context.Background(), prefix, flag.Arg(0), opts); err != nil {
 		slog.Error("run error", "err", err)
 		os.Exit(1)
 	}

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -207,6 +208,7 @@ func TestBucketPutOutput_PersistsAndUploads(t *testing.T) {
 
 	content := []byte("hello bucket")
 	outputID := hashID(content)
+	actionID := strings.Repeat("a", 64)
 
 	pathname, exists, err := b.PutOutput(ctx, outputID, bytes.NewReader(content))
 	if err != nil {
@@ -216,11 +218,15 @@ func TestBucketPutOutput_PersistsAndUploads(t *testing.T) {
 		t.Error("expected exists=false")
 	}
 
-	// On-disk first; upload happens via worker.
+	// On-disk first; upload happens via worker once the action is linked.
 	if got, err := os.ReadFile(pathname); err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(got, content) {
 		t.Errorf("disk content mismatch")
+	}
+
+	if _, err := b.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		t.Fatal(err)
 	}
 
 	// Drain the upload queue.
@@ -232,6 +238,98 @@ func TestBucketPutOutput_PersistsAndUploads(t *testing.T) {
 	}
 	if !bytes.Equal(got, content) {
 		t.Errorf("uploaded content mismatch")
+	}
+
+	attrs, err := underlying.Attributes(ctx, path.Join(actionDir, actionID))
+	if err != nil {
+		t.Fatalf("bucket Attributes: %v", err)
+	}
+	if attrs.Metadata["output_id"] != outputID {
+		t.Errorf("metadata=%v, want output_id=%s", attrs.Metadata, outputID)
+	}
+}
+
+func TestBucketLinkActionToOutput_NotPublishedWithoutOutput(t *testing.T) {
+	ctx := context.Background()
+	b, underlying := newBucket(t)
+
+	actionID := strings.Repeat("a", 64)
+	outputID := strings.Repeat("b", 64) // never written to disk, so can't be uploaded
+
+	if _, err := b.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+
+	exists, err := underlying.Exists(ctx, path.Join(actionDir, actionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("action link published for an output that was never uploaded")
+	}
+}
+
+func TestBucketUpload_SkipsExistingOutput(t *testing.T) {
+	ctx := context.Background()
+	b, underlying := newBucket(t)
+
+	content := []byte("already there")
+	outputID := hashID(content)
+	actionID := strings.Repeat("a", 64)
+
+	// Outputs are content addressed, so an existing object is never replaced.
+	// A sentinel body lets us observe whether it was.
+	if err := underlying.WriteAll(ctx, path.Join(outputDir, outputID), []byte("sentinel"), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := b.PutOutput(ctx, outputID, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+
+	got, err := underlying.ReadAll(ctx, path.Join(outputDir, outputID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "sentinel" {
+		t.Errorf("existing output was re-uploaded")
+	}
+	if exists, _ := underlying.Exists(ctx, path.Join(actionDir, actionID)); !exists {
+		t.Error("expected action link to be published")
+	}
+}
+
+func TestBucketUpload_OutputSharedByActions(t *testing.T) {
+	ctx := context.Background()
+	b, underlying := newBucket(t)
+
+	content := []byte("shared output")
+	outputID := hashID(content)
+	if _, _, err := b.PutOutput(ctx, outputID, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	actions := []string{strings.Repeat("a", 64), strings.Repeat("c", 64), strings.Repeat("d", 64)}
+	for _, actionID := range actions {
+		if _, err := b.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b.Close()
+
+	for _, actionID := range actions {
+		attrs, err := underlying.Attributes(ctx, path.Join(actionDir, actionID))
+		if err != nil {
+			t.Fatalf("action %s: %v", actionID, err)
+		}
+		if attrs.Metadata["output_id"] != outputID {
+			t.Errorf("action %s: metadata=%v", actionID, attrs.Metadata)
+		}
 	}
 }
 
@@ -456,8 +554,13 @@ func TestBucketLinkActionToOutput(t *testing.T) {
 	ctx := context.Background()
 	b, underlying := newBucket(t)
 
+	content := []byte("linked")
+	outputID := hashID(content)
 	actionID := strings.Repeat("a", 64)
-	outputID := strings.Repeat("b", 64)
+
+	if _, _, err := b.PutOutput(ctx, outputID, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
 
 	exists, err := b.LinkActionToOutput(ctx, actionID, outputID)
 	if err != nil {
@@ -467,14 +570,6 @@ func TestBucketLinkActionToOutput(t *testing.T) {
 		t.Error("expected exists=false on first link")
 	}
 
-	attrs, err := underlying.Attributes(ctx, path.Join(actionDir, actionID))
-	if err != nil {
-		t.Fatalf("bucket Attributes: %v", err)
-	}
-	if attrs.Metadata["output_id"] != outputID {
-		t.Errorf("metadata=%v, want output_id=%s", attrs.Metadata, outputID)
-	}
-
 	// Idempotent path skips the bucket upload but still reports exists=true.
 	exists, err = b.LinkActionToOutput(ctx, actionID, outputID)
 	if err != nil {
@@ -482,6 +577,16 @@ func TestBucketLinkActionToOutput(t *testing.T) {
 	}
 	if !exists {
 		t.Error("expected exists=true on idempotent link")
+	}
+
+	b.Close()
+
+	attrs, err := underlying.Attributes(ctx, path.Join(actionDir, actionID))
+	if err != nil {
+		t.Fatalf("bucket Attributes: %v", err)
+	}
+	if attrs.Metadata["output_id"] != outputID {
+		t.Errorf("metadata=%v, want output_id=%s", attrs.Metadata, outputID)
 	}
 }
 
@@ -496,9 +601,141 @@ func TestBucketPutAfterClose(t *testing.T) {
 	b, _ := newBucket(t)
 	b.Close()
 
-	content := []byte("hi")
-	_, _, err := b.PutOutput(ctx, hashID(content), bytes.NewReader(content))
+	_, err := b.LinkActionToOutput(ctx, strings.Repeat("a", 64), strings.Repeat("b", 64))
 	if err == nil {
-		t.Error("expected error from PutOutput after Close")
+		t.Error("expected error from LinkActionToOutput after Close")
+	}
+}
+
+func TestDiskLinkActionToOutput_WritesFile(t *testing.T) {
+	d := newDisk(t)
+	ctx := context.Background()
+
+	actionID := strings.Repeat("a", 64)
+	outputID := strings.Repeat("b", 64)
+
+	if _, err := d.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Lstat(filepath.Join(d.cacheDir, actionDir, actionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Errorf("action link mode = %v, want a regular file", fi.Mode())
+	}
+}
+
+func TestDiskOutputIDFromAction_LegacySymlink(t *testing.T) {
+	d := newDisk(t)
+	ctx := context.Background()
+
+	actionID := strings.Repeat("a", 64)
+	outputID := strings.Repeat("b", 64)
+	actionPath := filepath.Join(d.cacheDir, actionDir, actionID)
+	if err := os.Symlink(filepath.Join("..", outputDir, outputID), actionPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	got, err := d.OutputIDFromAction(ctx, actionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != outputID {
+		t.Errorf("got %q, want %q", got, outputID)
+	}
+
+	// Relinking replaces the legacy symlink with a file.
+	newOutput := strings.Repeat("c", 64)
+	if _, err := d.LinkActionToOutput(ctx, actionID, newOutput); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := d.OutputIDFromAction(ctx, actionID); got != newOutput {
+		t.Errorf("got %q, want %q after relink", got, newOutput)
+	}
+}
+
+func TestDiskOutputIDFromAction_RejectsInvalidFile(t *testing.T) {
+	d := newDisk(t)
+	actionID := strings.Repeat("a", 64)
+	actionPath := filepath.Join(d.cacheDir, actionDir, actionID)
+	if err := os.WriteFile(actionPath, []byte("../../etc/passwd"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.OutputIDFromAction(context.Background(), actionID); err == nil {
+		t.Error("expected error for invalid link contents")
+	}
+}
+
+func TestBucket_BreakerStopsUsingFailingBucket(t *testing.T) {
+	ctx := context.Background()
+	d := newDisk(t)
+
+	// Every operation on a closed bucket fails, like a bucket with bad
+	// credentials would.
+	underlying := memblob.OpenBucket(nil)
+	underlying.Close()
+
+	b := &Bucket{disk: d, bucket: underlying}
+	b.Start(ctx)
+	t.Cleanup(b.Close)
+
+	for i := range maxConsecutiveFailures + 3 {
+		_, err := b.OutputIDFromAction(ctx, fmt.Sprintf("%064x", i))
+		if i < maxConsecutiveFailures && err == nil {
+			t.Fatalf("lookup %d: expected error from failing bucket", i)
+		}
+		if i >= maxConsecutiveFailures && err != nil {
+			t.Fatalf("lookup %d: expected a miss once disabled, got %v", i, err)
+		}
+	}
+
+	if got := b.stats.RemoteLookups.Load(); got != maxConsecutiveFailures {
+		t.Errorf("remote lookups = %d, want %d", got, maxConsecutiveFailures)
+	}
+
+	// Puts still work locally, and no upload is attempted.
+	content := []byte("local only")
+	outputID := hashID(content)
+	actionID := strings.Repeat("a", 64)
+	if _, _, err := b.PutOutput(ctx, outputID, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+
+	if got, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
+		t.Errorf("local lookup = %q, %v; want %q", got, err, outputID)
+	}
+	if got := b.stats.UploadErrors.Load(); got != 0 {
+		t.Errorf("upload errors = %d, want 0", got)
+	}
+}
+
+func TestBreaker_ResetsOnSuccess(t *testing.T) {
+	underlying := memblob.OpenBucket(nil)
+	underlying.Close()
+	_, failure := underlying.Attributes(context.Background(), "x")
+	if failure == nil {
+		t.Fatal("expected closed bucket to fail")
+	}
+
+	var br breaker
+	for range maxConsecutiveFailures - 1 {
+		br.record(failure)
+	}
+	br.record(nil)
+	for range maxConsecutiveFailures - 1 {
+		br.record(failure)
+	}
+	if !br.allow() {
+		t.Error("breaker tripped without consecutive failures")
+	}
+	br.record(failure)
+	if br.allow() {
+		t.Error("breaker didn't trip")
 	}
 }

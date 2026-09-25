@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -256,7 +257,7 @@ func TestServe_RoundTrip(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		err := serve(ctx, underlying, dir, false, inR, outW)
+		err := serve(ctx, underlying, options{cacheDir: dir}, inR, outW)
 		outW.Close()
 		done <- err
 	}()
@@ -330,7 +331,7 @@ func TestServe_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestServe_Readonly_OmitsPut(t *testing.T) {
+func TestServe_Readonly_KeepsPutsLocal(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	underlying := memblob.OpenBucket(nil)
@@ -341,7 +342,7 @@ func TestServe_Readonly_OmitsPut(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		err := serve(ctx, underlying, dir, true, inR, outW)
+		err := serve(ctx, underlying, options{cacheDir: dir, readonly: true}, inR, outW)
 		outW.Close()
 		done <- err
 	}()
@@ -351,20 +352,58 @@ func TestServe_Readonly_OmitsPut(t *testing.T) {
 	if err := dec.Decode(&handshake); err != nil {
 		t.Fatalf("handshake: %v", err)
 	}
-	if len(handshake.KnownCommands) != 2 {
-		t.Errorf("KnownCommands=%v, want 2 (close, get)", handshake.KnownCommands)
-	}
+
+	// the go command reads back some puts within one invocation, so they
+	// must still be accepted
+	var canPut bool
 	for _, c := range handshake.KnownCommands {
-		if c == cmdPut {
-			t.Error("readonly mode should not advertise cmdPut")
-		}
+		canPut = canPut || c == cmdPut
+	}
+	if !canPut {
+		t.Fatalf("KnownCommands=%v, want put", handshake.KnownCommands)
 	}
 
+	body := []byte("local only")
+	actionID := bytes.Repeat([]byte{0xaa}, 32)
+	outputID := sha256.Sum256(body)
+	// like the go command, wait for each response before the next request
+	enc := json.NewEncoder(inW)
+	roundTrip := func(req request, body []byte) response {
+		t.Helper()
+
+		go func() {
+			enc.Encode(req)
+			if body != nil {
+				enc.Encode(body)
+			}
+		}()
+
+		var resp response
+		if err := dec.Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Err != "" {
+			t.Errorf("request %d: %s", resp.ID, resp.Err)
+		}
+		return resp
+	}
+
+	roundTrip(request{ID: 1, Command: cmdPut, ActionID: actionID, OutputID: outputID[:], BodySize: int64(len(body))}, body)
+	if resp := roundTrip(request{ID: 2, Command: cmdGet, ActionID: actionID}, nil); resp.Miss || resp.DiskPath == "" {
+		t.Errorf("get after readonly put missed: %+v", resp)
+	}
+	roundTrip(request{ID: 3, Command: cmdClose}, nil)
 	inW.Close()
+
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("serve did not return")
+	}
+
+	iter := underlying.List(nil)
+	if obj, err := iter.Next(ctx); err != io.EOF {
+		t.Errorf("readonly mode wrote to the bucket: %v %v", obj, err)
 	}
 }
 
@@ -379,7 +418,7 @@ func TestServe_BodySizeMismatch(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		err := serve(ctx, underlying, dir, false, inR, outW)
+		err := serve(ctx, underlying, options{cacheDir: dir}, inR, outW)
 		outW.Close()
 		done <- err
 	}()
@@ -430,7 +469,7 @@ func TestServe_ObjectIDFallback(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		err := serve(ctx, underlying, dir, false, inR, outW)
+		err := serve(ctx, underlying, options{cacheDir: dir}, inR, outW)
 		outW.Close()
 		done <- err
 	}()
