@@ -76,18 +76,21 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 		return nil
 	}
 
-	err := b.bucket.Copy(ctx, job.key, job.key, &blob.CopyOptions{
-		BeforeCopy: func(asFunc func(any) bool) error {
-			// S3 refuses to copy an object onto itself unless something about
-			// it changes, so have it replace the metadata, with the same.
-			var input *s3.CopyObjectInput
-			if asFunc(&input) {
-				input.MetadataDirective = s3types.MetadataDirectiveReplace
-				input.Metadata = job.metadata
-				input.ContentType = aws.String(job.contentType)
-			}
-			return nil
-		},
+	err := b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
+		return b.bucket.Copy(ctx, job.key, job.key, &blob.CopyOptions{
+			BeforeCopy: func(asFunc func(any) bool) error {
+				// S3 refuses to copy an object onto itself unless something
+				// about it changes, so have it replace the metadata, with the
+				// same.
+				var input *s3.CopyObjectInput
+				if asFunc(&input) {
+					input.MetadataDirective = s3types.MetadataDirectiveReplace
+					input.Metadata = job.metadata
+					input.ContentType = aws.String(job.contentType)
+				}
+				return nil
+			},
+		})
 	})
 	if err == nil {
 		b.remote.record(nil)
@@ -97,7 +100,7 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 
 	slog.Debug("refreshing by copy failed, uploading instead", "key", job.key, "err", err)
 
-	var r io.Reader = bytes.NewReader(nil)
+	var r io.ReadSeeker = bytes.NewReader(nil)
 	if job.local != "" {
 		f, err := os.Open(job.local)
 		if err != nil {
@@ -107,9 +110,14 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 		r = f
 	}
 
-	err = b.bucket.Upload(ctx, job.key, r, &blob.WriterOptions{
-		Metadata:    job.metadata,
-		ContentType: job.contentType,
+	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		return b.bucket.Upload(ctx, job.key, r, &blob.WriterOptions{
+			Metadata:    job.metadata,
+			ContentType: job.contentType,
+		})
 	})
 	b.remote.record(err)
 	if err != nil {
