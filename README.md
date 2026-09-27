@@ -23,6 +23,7 @@ For more information on supported bucket URL parameters see https://gocloud.dev/
 - `-v` for verbose logging.
 - `-p` to specify key prefix.
 - `-readonly` to never write to the bucket.
+- `-dedupe-wait` to set how long to wait for another process sharing the local cache to put an action it's computing, rather than computing it too (default `1m`, `0` disables). See [concurrent go commands](#concurrent-go-commands).
 - `-refresh-after` to set how old an entry must be before a writer that uses it refreshes it (default `24h`, `0` disables). See [expiring old entries](#expiring-old-entries).
 - `-stats` to log a summary of hits, misses and transfers when the process exits.
 - `-dir` to specify the local cache directory (default `<user cache dir>/.gocachebucket`).
@@ -44,6 +45,12 @@ Set every checked-out file's modification time to something stable and in the pa
 Every bucket call is bounded and retried the same way whichever provider is behind it: up to 3 attempts with backoff, each limited to 30 seconds for lookups and small writes, or 5 minutes for transferring an output. The limit also bounds retries done inside a provider's SDK, which for some reads otherwise continue until their context ends.
 
 gocloud reports most server errors and throttling (a GCS 503, most S3 and Azure errors) as `Unknown`, so `Unknown` errors are retried, along with `Internal`, `ResourceExhausted` and timeouts. Some permanent errors are `Unknown` too, such as a malformed credentials file, and are retried as well before gobuildcache gives up on the bucket. Errors that can't change, such as not found or permission denied, are not retried.
+
+## concurrent go commands
+
+Go commands running at the same time with the same `-dir`, such as packages tested concurrently or several binaries built at once, coordinate their misses. The first to miss on an action claims it with a lock file in the local cache directory and computes it; the others wait for it to be put, then get a hit instead of computing it too. On a cold cache, where concurrent commands share many dependencies, that avoids compiling the same packages several times over.
+
+A claim is released when its action is put, and all of a process's claims when it exits. A claim held by a process that no longer exists is taken over on unix. Waiting is bounded by `-dedupe-wait`, since the go command looks up some entries it never puts, such as its index of a directory with recently modified files; when a wait times out, a marker stops others waiting for that action again.
 
 ## expiring old entries
 

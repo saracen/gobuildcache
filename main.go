@@ -69,11 +69,38 @@ type Cacher struct {
 	disk   *Disk
 	bucket *Bucket
 	flight singleflight.Group
+
+	// claims coordinates misses with other processes sharing the local
+	// cache directory; nil to not.
+	claims *claims
 }
 
 func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
 	actionID := hex.EncodeToString(req.ActionID)
 
+	pathname, err := c.get(ctx, actionID)
+	if err != nil || pathname != "" || c.claims == nil {
+		return pathname, err
+	}
+
+	return c.claims.awaitOrClaim(ctx, actionID, func() string { return c.localHit(actionID) }), nil
+}
+
+// localHit returns the path of actionID's output if it's in the local cache.
+func (c *Cacher) localHit(actionID string) string {
+	outputID, err := c.disk.OutputIDFromAction(context.Background(), actionID)
+	if err != nil || outputID == "" {
+		return ""
+	}
+
+	pathname := filepath.Join(c.disk.cacheDir, outputDir, outputID)
+	if _, err := os.Stat(pathname); err != nil {
+		return ""
+	}
+	return pathname
+}
+
+func (c *Cacher) get(ctx context.Context, actionID string) (string, error) {
 	slog.Debug("get", "action", actionID)
 
 	outputID, err := c.bucket.OutputIDFromAction(ctx, actionID)
@@ -117,6 +144,9 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	}
 
 	_, err = c.bucket.LinkActionToOutput(ctx, actionID, outputID)
+	if c.claims != nil {
+		c.claims.release(actionID)
+	}
 	if err != nil {
 		return pathname.(string), fmt.Errorf("linking action to output: %w", err)
 	}
@@ -129,6 +159,7 @@ type options struct {
 	readonly     bool
 	stats        bool
 	refreshAfter time.Duration
+	dedupeWait   time.Duration
 }
 
 func defaultCacheDir() (string, error) {
@@ -163,6 +194,9 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 	// uploads, but if stdin is closed without it we still want queued uploads
 	// to finish.
 	defer func() {
+		if cacher.claims != nil {
+			cacher.claims.releaseAll()
+		}
 		cacher.bucket.Close()
 		if opts.stats {
 			cacher.bucket.stats.Log()
@@ -174,6 +208,14 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 	}
 	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, outputDir), 0o755); err != nil {
 		return fmt.Errorf("creating cache output dir: %w", err)
+	}
+
+	if opts.dedupeWait > 0 {
+		claims, err := newClaims(cacher.disk.cacheDir, opts.dedupeWait, &cacher.bucket.stats)
+		if err != nil {
+			return err
+		}
+		cacher.claims = claims
 	}
 
 	// Puts are accepted even when readonly, and only kept locally: the go
@@ -327,6 +369,7 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "verbose")
 	flag.BoolVar(&opts.readonly, "readonly", false, "never write to the bucket, only to the local cache")
 	flag.BoolVar(&opts.stats, "stats", false, "log hit/miss and transfer statistics on exit")
+	flag.DurationVar(&opts.dedupeWait, "dedupe-wait", time.Minute, "how long to wait for another process sharing the local cache to put an action it's computing, rather than computing it too (0 disables)")
 	flag.DurationVar(&opts.refreshAfter, "refresh-after", 24*time.Hour, "rewrite objects older than this when using them, to restart their expiry (0 disables)")
 	flag.StringVar(&opts.cacheDir, "dir", "", "local cache directory (default: <user cache dir>/.gocachebucket)")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
