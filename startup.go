@@ -29,12 +29,19 @@ const (
 )
 
 // startupTimeout bounds the check of the bucket before a process first uses
-// it. A working bucket answers in well under a second, including exchanging
-// credentials for a token. Some provider SDKs retry connection errors until
-// their context ends, and can't get through a black hole anyway, so without
-// a tight bound here an unreachable bucket or token service costs every go
-// command minutes of retrying before the breaker trips.
-var startupTimeout = 5 * time.Second
+// it. Some provider SDKs retry connection errors until their context ends,
+// and can't get through a black hole anyway, so without a bound here an
+// unreachable bucket or token service costs every go command minutes of
+// retrying before the breaker trips.
+//
+// A working bucket answers in well under a second, including exchanging
+// credentials for a token, but a resolver resends a lost DNS query only
+// after its timeout, 5s by default for Go's resolver and glibc's, and the
+// check can need two hosts resolved in turn, the token service's and the
+// bucket's. So the bound leaves room for a lost query for each: tripping
+// on one would turn a working bucket off for the whole job, whereas in a
+// real outage the marker means only the first go command pays the bound.
+var startupTimeout = 15 * time.Second
 
 // useRemote reports whether to use the bucket, first checking it's usable if
 // the process hasn't yet (see checkRemote). Calls made while the check runs

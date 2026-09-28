@@ -117,8 +117,8 @@ func TestEndToEnd_UnreachableBucket(t *testing.T) {
 			}
 			took := time.Since(start)
 
-			// about startupTimeout for the first go command, and compiling
-			if took > 30*time.Second {
+			// startupTimeout for the first go command, and compiling
+			if took > startupTimeout+30*time.Second {
 				t.Errorf("10 go commands took %v", took)
 			}
 			stats := parseStats(t, out.String())

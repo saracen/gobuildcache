@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
@@ -21,6 +23,7 @@ import (
 	"gocloud.dev/blob/gcsblob"
 	"gocloud.dev/blob/memblob"
 	"gocloud.dev/gcp"
+	"google.golang.org/api/option"
 )
 
 // quickStartup bounds the startup check tightly for a test.
@@ -186,6 +189,133 @@ func TestStartup_TokenExchangeThatNeverAnswers(t *testing.T) {
 	}
 	if _, err := os.Stat(b.remote.marker); err != nil {
 		t.Errorf("marker: %v", err)
+	}
+}
+
+// lossyDNS answers A queries for any name with 127.0.0.1, and other queries
+// with no records, after dropping the first drop queries it's sent.
+type lossyDNS struct {
+	conn    net.PacketConn
+	drop    int64
+	queries atomic.Int64
+}
+
+func newLossyDNS(t *testing.T, drop int64) *lossyDNS {
+	t.Helper()
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	d := &lossyDNS{conn: conn, drop: drop}
+
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, addr, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if d.queries.Add(1) <= d.drop {
+				continue
+			}
+			if answer := dnsAnswer(buf[:n]); answer != nil {
+				conn.WriteTo(answer, addr)
+			}
+		}
+	}()
+	return d
+}
+
+// dnsAnswer answers a query with one question.
+func dnsAnswer(query []byte) []byte {
+	if len(query) < 12 {
+		return nil
+	}
+	// the question: the name's labels, then its type and class
+	end := 12
+	for end < len(query) && query[end] != 0 {
+		end += int(query[end]) + 1
+	}
+	end += 5
+	if end > len(query) {
+		return nil
+	}
+	qtype := binary.BigEndian.Uint16(query[end-4:])
+
+	answer := append([]byte(nil), query[:end]...)
+	binary.BigEndian.PutUint16(answer[2:], 0x8180) // a response, recursion desired and available
+	binary.BigEndian.PutUint16(answer[4:], 1)      // questions
+	binary.BigEndian.PutUint16(answer[6:], 0)      // answers
+	binary.BigEndian.PutUint16(answer[8:], 0)      // authorities
+	binary.BigEndian.PutUint16(answer[10:], 0)     // additional records
+	if qtype == 1 {
+		binary.BigEndian.PutUint16(answer[6:], 1)
+		// the question's name, type A, class IN, a TTL, and the address
+		answer = append(answer, 0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1)
+	}
+	return answer
+}
+
+// A resolver resends a query it gets no answer to after its timeout, 5s by
+// default for both Go's resolver and glibc's, so losing one packet makes a
+// healthy bucket that long to answer. The startup check mustn't take that
+// as the bucket being unreachable, which would turn it off for the job.
+func TestStartup_LostDNSQueryKeepsTheBucket(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for the resolver to resend a query")
+	}
+
+	dns := newLossyDNS(t, 1)
+	// not net.DefaultResolver, which other tests' calls may still be using
+	dialer := &net.Dialer{Resolver: &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", dns.conn.LocalAddr().String())
+		},
+	}}
+	transport := &http.Transport{DialContext: dialer.DialContext}
+	t.Cleanup(transport.CloseIdleConnections)
+
+	var requests atomic.Int64
+	gcs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"error":{"code":404,"message":"Not Found"}}`)
+	}))
+	t.Cleanup(gcs.Close)
+	_, port, err := net.SplitHostPort(gcs.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	endpoint := "http://" + net.JoinHostPort("storage.gobuildcache.test", port) + "/storage/v1/"
+	underlying, err := gcsblob.OpenBucket(context.Background(), gcp.NewAnonymousHTTPClient(transport), "bucket", &gcsblob.Options{
+		ClientOptions: []option.ClientOption{option.WithEndpoint(endpoint)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { underlying.Close() })
+	b := checkedBucket(t, underlying, t.TempDir())
+
+	start := time.Now()
+	if _, _, err := b.OutputIDFromAction(context.Background(), someAction); err != nil {
+		t.Error(err)
+	}
+	t.Logf("lookup took %v, after %d DNS queries", time.Since(start), dns.queries.Load())
+
+	if dns.queries.Load() <= dns.drop {
+		t.Fatal("the lookup didn't resolve the bucket's host")
+	}
+	if !b.remote.allow() {
+		t.Error("bucket turned off")
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("requests = %d, want the check and the lookup", got)
 	}
 }
 
