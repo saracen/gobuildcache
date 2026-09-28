@@ -21,7 +21,6 @@ import (
 	"gocloud.dev/blob"
 	_ "gocloud.dev/blob/azureblob"
 	_ "gocloud.dev/blob/fileblob"
-	_ "gocloud.dev/blob/gcsblob"
 	_ "gocloud.dev/blob/s3blob"
 	"golang.org/x/sync/singleflight"
 )
@@ -222,7 +221,7 @@ func readTestExpire() time.Time {
 }
 
 func run(ctx context.Context, prefix, bucketURL string, opts options) error {
-	bucket, err := blob.OpenBucket(ctx, bucketURL)
+	bucket, err := openBucket(ctx, bucketURL)
 	if err != nil {
 		return fmt.Errorf("opening bucket: %w", err)
 	}
