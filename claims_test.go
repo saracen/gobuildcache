@@ -215,3 +215,106 @@ func TestClaims_NeverWaitsOnItself(t *testing.T) {
 		t.Errorf("waited %v on its own claim", took)
 	}
 }
+
+// awaitGet starts a get of actionID with c, which must wait on another
+// process's claim, and returns what it gets.
+func awaitGet(t *testing.T, c *Cacher, actionID []byte) <-chan claimHit {
+	t.Helper()
+
+	done := make(chan claimHit, 1)
+	go func() {
+		pathname, putTime, err := c.Get(context.Background(), &request{ActionID: actionID})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- claimHit{pathname, putTime}
+	}()
+
+	select {
+	case got := <-done:
+		t.Fatalf("get didn't wait on the claim, got %q", got.path)
+	case <-time.After(200 * time.Millisecond):
+	}
+	return done
+}
+
+type claimHit struct {
+	path    string
+	putTime time.Time
+}
+
+func receive(t *testing.T, done <-chan claimHit) claimHit {
+	t.Helper()
+
+	select {
+	case got := <-done:
+		if got.path == "" {
+			t.Fatal("waiting process missed")
+		}
+		return got
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting process didn't get the put entry")
+	}
+	return claimHit{}
+}
+
+// TestClaims_HitReportsPutTime checks that a process that waited on another's
+// claim reports when the other put the entry, which can be long before, as
+// for a link from the bucket.
+func TestClaims_HitReportsPutTime(t *testing.T) {
+	dir, underlying := sharedDir(t)
+	a := newProcess(t, dir, underlying, time.Minute)
+	b := newProcess(t, dir, underlying, time.Minute)
+	actionID := bytes.Repeat([]byte{0xaa}, 32)
+
+	if got := get(t, a, actionID); got != "" {
+		t.Fatalf("first get = %q, want a miss", got)
+	}
+	done := awaitGet(t, b, actionID)
+
+	content := []byte("from the bucket")
+	putTime := time.Unix(1700000000, 0)
+	if _, _, err := a.disk.PutOutput(context.Background(), hashID(content), bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.disk.LinkActionToOutput(context.Background(), hex.EncodeToString(actionID), hashID(content), putTime); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := receive(t, done); !got.putTime.Equal(putTime) {
+		t.Errorf("claim hit put at %v, want %v", got.putTime, putTime)
+	}
+}
+
+// TestClaims_ExpireOthersHitIsExpired checks that with -expire-others, an
+// entry another process sharing the local cache put while this one waited on
+// its claim is reported as put at unknownPutTime, since this process didn't
+// put it, and that the other process still reports its own put time.
+func TestClaims_ExpireOthersHitIsExpired(t *testing.T) {
+	dir, underlying := sharedDir(t)
+	a := newProcess(t, dir, underlying, time.Minute)
+	b := newProcess(t, dir, underlying, time.Minute)
+	a.expireOthers, b.expireOthers = true, true
+	actionID := bytes.Repeat([]byte{0xaa}, 32)
+
+	if got := get(t, a, actionID); got != "" {
+		t.Fatalf("first get = %q, want a miss", got)
+	}
+	done := awaitGet(t, b, actionID)
+
+	before := time.Now()
+	put(t, a, actionID, []byte("test result"))
+	after := time.Now()
+
+	if got := receive(t, done); !got.putTime.Equal(unknownPutTime) {
+		t.Errorf("claim hit put at %v, want %v", got.putTime, unknownPutTime)
+	}
+
+	_, putTime, err := a.Get(context.Background(), &request{ActionID: actionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if putTime.Before(before.Add(-time.Second)) || putTime.After(after) {
+		t.Errorf("putting process's get put at %v, want its put, between %v and %v", putTime, before, after)
+	}
+}

@@ -74,6 +74,12 @@ type Cacher struct {
 	// claims coordinates misses with other processes sharing the local
 	// cache directory; nil to not.
 	claims *claims
+
+	// expireOthers reports every entry this process didn't put as put at
+	// unknownPutTime, so "go clean -testcache" expires every test result
+	// this go command didn't produce, including ones put after it ran.
+	expireOthers bool
+	puts         sync.Map // actionID -> outputID this process put
 }
 
 // Get returns the path of the action's output, or "" on a miss, and when its
@@ -84,15 +90,22 @@ func (c *Cacher) Get(ctx context.Context, req *request) (string, time.Time, erro
 	actionID := hex.EncodeToString(req.ActionID)
 
 	pathname, putTime, err := c.get(ctx, actionID)
-	if err != nil || pathname != "" || c.claims == nil {
-		return pathname, putTime, err
+	if err == nil && pathname == "" && c.claims != nil {
+		pathname = c.claims.awaitOrClaim(ctx, actionID, func() string {
+			pathname, putTime = c.localHit(actionID)
+			return pathname
+		})
 	}
 
-	pathname = c.claims.awaitOrClaim(ctx, actionID, func() string {
-		pathname, putTime = c.localHit(actionID)
-		return pathname
-	})
-	return pathname, putTime, nil
+	// An entry is this process's if it's the output this process put for
+	// the action. Another process's put, from the bucket or sharing the
+	// local cache, links a different output unless it has the same bytes.
+	if pathname != "" && c.expireOthers {
+		if outputID, _ := c.puts.Load(actionID); outputID != filepath.Base(pathname) {
+			putTime = unknownPutTime
+		}
+	}
+	return pathname, putTime, err
 }
 
 // localHit returns the path of actionID's output and when it was put if it's
@@ -154,6 +167,9 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	}
 
 	_, err = c.bucket.LinkActionToOutput(ctx, actionID, outputID)
+	if err == nil {
+		c.puts.Store(actionID, outputID)
+	}
 	if c.claims != nil {
 		c.claims.release(actionID)
 	}
@@ -171,6 +187,7 @@ type options struct {
 	refreshAfter time.Duration
 	dedupeWait   time.Duration
 	testExpire   time.Time
+	expireOthers bool
 }
 
 func defaultCacheDir() (string, error) {
@@ -217,7 +234,8 @@ func run(ctx context.Context, prefix, bucketURL string, opts options) error {
 
 func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader, out io.Writer) error {
 	cacher := &Cacher{
-		disk: &Disk{cacheDir: opts.cacheDir},
+		disk:         &Disk{cacheDir: opts.cacheDir},
+		expireOthers: opts.expireOthers,
 	}
 	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly, refreshAfter: opts.refreshAfter, testExpire: opts.testExpire}
 	cacher.bucket.stats.Started = time.Now()
@@ -406,6 +424,7 @@ func main() {
 	flag.BoolVar(&opts.stats, "stats", false, "log hit/miss and transfer statistics on exit")
 	flag.DurationVar(&opts.dedupeWait, "dedupe-wait", time.Minute, "how long to wait for another process sharing the local cache to put an action it's computing, rather than computing it too (0 disables)")
 	flag.DurationVar(&opts.refreshAfter, "refresh-after", 24*time.Hour, "rewrite objects older than this when using them, to restart their expiry (0 disables)")
+	flag.BoolVar(&opts.expireOthers, "expire-others", false, "report entries this process didn't put as put at the Unix epoch, so that after \"go clean -testcache\" the go command reruns every test result it didn't produce itself")
 	flag.StringVar(&opts.cacheDir, "dir", "", "local cache directory (default: <user cache dir>/.gocachebucket)")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {

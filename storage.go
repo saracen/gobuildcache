@@ -36,7 +36,8 @@ const (
 	putTimeKey = "put_time"
 )
 
-// unknownPutTime is reported for action links uploaded without a put time.
+// unknownPutTime is reported for action links uploaded without a put time,
+// and with -expire-others for every entry this process didn't put.
 // The go command only uses an entry's time to expire test results put before
 // the last "go clean -testcache", so a time before any of those makes them
 // always expire, rather than risk replaying a result that should rerun. The

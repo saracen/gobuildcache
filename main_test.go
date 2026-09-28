@@ -48,7 +48,13 @@ func newCacher(t *testing.T) *Cacher {
 // newCacherOn returns a Cacher with its own local cache, using underlying.
 func newCacherOn(t *testing.T, underlying *blob.Bucket) *Cacher {
 	t.Helper()
-	dir := t.TempDir()
+	return newCacherIn(t, underlying, t.TempDir())
+}
+
+// newCacherIn returns a Cacher using underlying and the local cache in dir,
+// as each process sharing dir has.
+func newCacherIn(t *testing.T, underlying *blob.Bucket, dir string) *Cacher {
+	t.Helper()
 	for _, sub := range []string{actionDir, outputDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
 			t.Fatal(err)
@@ -400,6 +406,124 @@ func TestHandleRequest_GetTimeMatchesOutput(t *testing.T) {
 		if want := putTimes[outputID]; !resp.Time.Equal(want) {
 			t.Fatalf("get %d returned output %s with put time %v, want %v", i, outputID, resp.Time, want)
 		}
+	}
+}
+
+// TestHandleRequest_ExpireOthers checks that with -expire-others, a get
+// reports the put time of an entry this process put, and of every other entry
+// wherever it's from, unknownPutTime, which "go clean -testcache" expires.
+func TestHandleRequest_ExpireOthers(t *testing.T) {
+	ctx := context.Background()
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+	get := &request{ID: 1, Command: cmdGet, ActionID: actionID}
+
+	// put puts content for actionID with c, returning when it was put.
+	put := func(t *testing.T, c *Cacher, content string) (time.Time, time.Time) {
+		t.Helper()
+		before := time.Now()
+		if resp := handleRequest(ctx, c, &request{
+			ID: 2, Command: cmdPut, ActionID: actionID, OutputID: sha256Bytes([]byte(content)),
+			Body: strings.NewReader(content), BodySize: int64(len(content)),
+		}); resp.Err != "" {
+			t.Fatal(resp.Err)
+		}
+		return before, time.Now()
+	}
+
+	for _, tc := range []struct {
+		name string
+		// run puts and gets entries for actionID with self, a process using
+		// underlying and the local cache in dir, and others, returning what
+		// self's last get should get and whether it's self's put, between
+		// before and after.
+		run func(t *testing.T, self *Cacher, underlying *blob.Bucket, dir string) (content string, own bool, before, after time.Time)
+	}{
+		{
+			name: "put by this process",
+			run: func(t *testing.T, self *Cacher, _ *blob.Bucket, _ string) (string, bool, time.Time, time.Time) {
+				before, after := put(t, self, "ours")
+				return "ours", true, before, after
+			},
+		},
+		{
+			name: "put by this process, readonly",
+			run: func(t *testing.T, self *Cacher, underlying *blob.Bucket, _ string) (string, bool, time.Time, time.Time) {
+				self.bucket.readonly = true
+				before, after := put(t, self, "ours")
+				self.bucket.Close()
+				if ok, err := underlying.Exists(ctx, path.Join(actionDir, hex.EncodeToString(actionID))); ok || err != nil {
+					t.Errorf("readonly put uploaded its action link: %v, %v", ok, err)
+				}
+				return "ours", true, before, after
+			},
+		},
+		{
+			name: "from the bucket, put by another job",
+			run: func(t *testing.T, _ *Cacher, underlying *blob.Bucket, _ string) (string, bool, time.Time, time.Time) {
+				other := newCacherOn(t, underlying)
+				put(t, other, "theirs")
+				other.bucket.Close()
+				return "theirs", false, time.Time{}, time.Time{}
+			},
+		},
+		{
+			name: "from the local cache, put by an earlier process",
+			run: func(t *testing.T, _ *Cacher, underlying *blob.Bucket, dir string) (string, bool, time.Time, time.Time) {
+				put(t, newCacherIn(t, underlying, dir), "theirs")
+				return "theirs", false, time.Time{}, time.Time{}
+			},
+		},
+		{
+			name: "put by another process sharing the local cache after this one",
+			run: func(t *testing.T, self *Cacher, underlying *blob.Bucket, dir string) (string, bool, time.Time, time.Time) {
+				put(t, self, "ours")
+				put(t, newCacherIn(t, underlying, dir), "theirs")
+				return "theirs", false, time.Time{}, time.Time{}
+			},
+		},
+		{
+			name: "put by this process after another's",
+			run: func(t *testing.T, self *Cacher, underlying *blob.Bucket, dir string) (string, bool, time.Time, time.Time) {
+				put(t, newCacherIn(t, underlying, dir), "theirs")
+				if resp := handleRequest(ctx, self, get); resp.Miss || resp.Time == nil || !resp.Time.Equal(unknownPutTime) {
+					t.Fatalf("get before rerunning = %+v, want a hit put at %v", resp, unknownPutTime)
+				}
+				before, after := put(t, self, "ours")
+				return "ours", true, before, after
+			},
+		},
+		{
+			name: "put by this process and another sharing the local cache, the same",
+			run: func(t *testing.T, self *Cacher, underlying *blob.Bucket, dir string) (string, bool, time.Time, time.Time) {
+				before, _ := put(t, self, "same")
+				_, after := put(t, newCacherIn(t, underlying, dir), "same")
+				return "same", true, before, after
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			underlying := memblob.OpenBucket(nil)
+			t.Cleanup(func() { underlying.Close() })
+			dir := t.TempDir()
+			self := newCacherIn(t, underlying, dir)
+			self.expireOthers = true
+
+			content, own, before, after := tc.run(t, self, underlying, dir)
+
+			resp := handleRequest(ctx, self, get)
+			if resp.Miss || resp.Err != "" || resp.Time == nil {
+				t.Fatalf("get = %+v, want a hit", resp)
+			}
+			if got := hex.EncodeToString(resp.OutputID); got != hashID([]byte(content)) {
+				t.Fatalf("get returned output %s, want %s's, %s", got, content, hashID([]byte(content)))
+			}
+			switch {
+			case !own && !resp.Time.Equal(unknownPutTime):
+				t.Errorf("get Time = %v, want %v for an entry another process put", resp.Time, unknownPutTime)
+			case own && (resp.Time.Before(before.Add(-time.Second)) || resp.Time.After(after)):
+				t.Errorf("get Time = %v, want this process's put, between %v and %v", resp.Time, before, after)
+			}
+		})
 	}
 }
 

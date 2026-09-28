@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"io/fs"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,13 +120,16 @@ func TestEndToEnd_CleanTestcache(t *testing.T) {
 // TestEndToEnd_ExpireTestResultsWithConcurrentWriters checks what the README
 // says about jobs that must rerun every test while other jobs write to the
 // bucket. "go clean -testcache" only expires results put before it ran, so
-// such a job replays a result another job puts after that; writing an expiry
-// in the far future instead reruns everything, and still stores the results.
+// such a job replays a result another job puts after that; with
+// -expire-others as well, it reruns everything, and still stores the results
+// with when it put them.
 func TestEndToEnd_ExpireTestResultsWithConcurrentWriters(t *testing.T) {
 	tmp := t.TempDir()
 	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
 	mod := writeStampModule(t, tmp)
-	env := func(name string) []string { return jobEnv(tmp, name, bin, bucketURL, "-stats") }
+	env := func(name string, flags ...string) []string {
+		return jobEnv(tmp, name, bin, bucketURL, append([]string{"-stats"}, flags...)...)
+	}
 
 	if _, cached, _ := goTestStamp(t, goBin, mod, env("first")); cached {
 		t.Fatal("first job's test result was cached")
@@ -144,31 +146,30 @@ func TestEndToEnd_ExpireTestResultsWithConcurrentWriters(t *testing.T) {
 		t.Errorf("cleaned job: cached=%v from run %s, want cached from the other job's run %s; if the go command no longer replays it, update the README", cached, got, other)
 	}
 
-	// The same, expiring every test result instead.
-	gocache := filepath.Join(tmp, "expired-gocache")
-	if err := os.MkdirAll(gocache, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(gocache, "testexpire.txt"), []byte(strconv.FormatInt(math.MaxInt64, 10)+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// The same, with -expire-others. Another job cleans before it too, and
+	// tests after it.
+	goCleanTestcache(t, goBin, mod, env("expiring", "-expire-others"))
+	goCleanTestcache(t, goBin, mod, env("cleaned2"))
 	goCleanTestcache(t, goBin, mod, env("other2"))
 	other, cached, _ = goTestStamp(t, goBin, mod, env("other2"))
 	if cached {
 		t.Fatal("other job's test result was cached after go clean -testcache")
 	}
-	// the go command never lowers the expiry
-	goCleanTestcache(t, goBin, mod, env("expired"))
-	expired, cached, stats := goTestStamp(t, goBin, mod, env("expired"))
-	if cached || expired == other {
-		t.Fatalf("job with a far-future expiry: cached=%v from run %s, want a rerun", cached, expired)
+	expiring, cached, stats := goTestStamp(t, goBin, mod, env("expiring", "-expire-others"))
+	if cached || expiring == other {
+		t.Fatalf("job with -expire-others: cached=%v from run %s, want a rerun, not the other job's run %s", cached, expiring, other)
 	}
 	if stats["uploads"] == 0 || stats["upload_errors"] != 0 {
 		t.Errorf("rerun wasn't stored: %v", stats)
 	}
 
-	if got, cached, _ := goTestStamp(t, goBin, mod, env("later")); !cached || got != expired {
-		t.Errorf("later job: cached=%v from run %s, want cached from the rerun %s", cached, got, expired)
+	// Its result was stored with when it was put, after the job that cleaned
+	// before it, rather than when -expire-others reports it for other jobs.
+	if got, cached, _ := goTestStamp(t, goBin, mod, env("cleaned2")); !cached || got != expiring {
+		t.Errorf("job that cleaned before the job with -expire-others tested: cached=%v from run %s, want cached from its rerun %s", cached, got, expiring)
+	}
+	if got, cached, _ := goTestStamp(t, goBin, mod, env("later")); !cached || got != expiring {
+		t.Errorf("later job: cached=%v from run %s, want cached from the rerun %s", cached, got, expiring)
 	}
 }
 
