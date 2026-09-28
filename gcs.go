@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
+	"path/filepath"
+	"runtime"
 	"strconv"
 
 	"gocloud.dev/blob"
@@ -84,14 +87,25 @@ func gcsAnonymous(q url.Values) bool {
 }
 
 // gcsCredentialsClient returns an HTTP client authenticated with Application
-// Default Credentials, and the universe domain they're for. Credentials from
-// GOOGLE_APPLICATION_CREDENTIALS or gcloud's file don't use the metadata
-// server; on GCE without either, they come from it, as the token must.
+// Default Credentials, and the universe domain they're for.
 //
 // If there are no credentials, the client's requests fail, as with gcsblob's
 // default opener: the breaker then turns the bucket off, where failing to
 // start would fail every go command.
 func gcsCredentialsClient(ctx context.Context, universeDomain string) (*gcp.HTTPClient, string, error) {
+	// Without a credentials file, Application Default Credentials come from
+	// the metadata server, and looking them up asks it for the project ID
+	// and then the universe domain, neither needed for a token. This runs
+	// before gobuildcache answers the go command, where nothing bounds it,
+	// and where the metadata server can't be reached each lookup waits out
+	// the metadata client's retries. A compute token source asks it for
+	// nothing until the first call needs a token, which the startup check
+	// bounds; off GCE, that token request fails.
+	if !adcFromFile() {
+		client, err := gcp.NewHTTPClient(gcp.DefaultTransport(), google.ComputeTokenSource("", gcsScope))
+		return client, universeDomain, err
+	}
+
 	// Token requests, such as a workload identity federation token exchange,
 	// use this client for as long as the credentials are used. Without a
 	// timeout, an exchange that never answers holds up the bucket call that
@@ -105,6 +119,7 @@ func gcsCredentialsClient(ctx context.Context, universeDomain string) (*gcp.HTTP
 		return client, "", err
 	}
 
+	// from the file, or the default
 	universeDomain, err = creds.GetUniverseDomain()
 	if err != nil {
 		slog.Warn("getting GCP universe domain, using the default", "err", err)
@@ -113,6 +128,37 @@ func gcsCredentialsClient(ctx context.Context, universeDomain string) (*gcp.HTTP
 
 	client, err := gcp.NewHTTPClient(gcp.DefaultTransport(), creds.TokenSource)
 	return client, universeDomain, err
+}
+
+// gcsScope is the scope gcp.DefaultCredentialsWithParams asks for.
+const gcsScope = "https://www.googleapis.com/auth/cloud-platform"
+
+// adcFromFile reports whether Application Default Credentials come from a
+// file, rather than the metadata server: the one GOOGLE_APPLICATION_CREDENTIALS
+// names, or gcloud's, found as google.FindDefaultCredentials finds it, which
+// doesn't export where it looks.
+func adcFromFile() bool {
+	if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") != "" {
+		return true
+	}
+
+	const name = "application_default_credentials.json"
+	var pathname string
+	if runtime.GOOS == "windows" {
+		pathname = filepath.Join(os.Getenv("APPDATA"), "gcloud", name)
+	} else {
+		home := os.Getenv("HOME")
+		if home == "" {
+			if u, err := user.Current(); err == nil {
+				home = u.HomeDir
+			}
+		}
+		pathname = filepath.Join(home, ".config", "gcloud", name)
+	}
+
+	// read, as the lookup does, which moves on if it can't
+	_, err := os.ReadFile(pathname)
+	return err == nil
 }
 
 type failingTokenSource struct{ err error }

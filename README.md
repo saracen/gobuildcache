@@ -18,7 +18,7 @@ A readonly mode is supported, which never writes to the bucket. New cache entrie
 
 For more information on supported bucket URL parameters see https://gocloud.dev/howto/blob/#services.
 
-On GCS, gobuildcache authenticates with the credentials file named by `GOOGLE_APPLICATION_CREDENTIALS`, such as a workload identity federation configuration, or else Application Default Credentials, and with nothing for `?anonymous=true`. Unlike gocloud's default `gs://` opener, it never asks the GCE metadata server for a service account to sign URLs with, since it doesn't sign any. On a GCE VM whose job containers can't reach the metadata server, such as GitLab.com's SaaS runners, those lookups otherwise delay every go command by 14 to 42 seconds. Only Application Default Credentials that come from the metadata server itself still use it.
+On GCS, gobuildcache authenticates with the credentials file named by `GOOGLE_APPLICATION_CREDENTIALS`, such as a workload identity federation configuration, or else Application Default Credentials, and with nothing for `?anonymous=true`. Unlike gocloud's default `gs://` opener, it never asks the GCE metadata server for a service account to sign URLs with, since it doesn't sign any. On a GCE VM whose job containers can't reach the metadata server, such as GitLab.com's SaaS runners, those lookups otherwise delay every go command by 14 to 42 seconds. With neither `GOOGLE_APPLICATION_CREDENTIALS` nor gcloud's credentials file, Application Default Credentials come from the metadata server; gobuildcache only asks it for tokens, from when a call first needs one, and takes the universe domain from the `universe_domain` URL parameter, defaulting to `googleapis.com`, instead of asking for it.
 
 ### flags
 

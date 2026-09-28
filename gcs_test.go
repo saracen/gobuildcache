@@ -6,9 +6,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -132,11 +134,13 @@ func TestOpenBucket_GCSDoesNotWaitForTheMetadataServer(t *testing.T) {
 
 	tests := map[string]struct {
 		url      string
+		gcloud   bool // in gcloud's file rather than GOOGLE_APPLICATION_CREDENTIALS
 		wantAuth string
 		wantSTS  []string
 	}{
 		"anonymous":        {url: "gs://bucket?anonymous=true", wantAuth: ""},
 		"external account": {url: "gs://bucket", wantAuth: "Bearer " + fakeAccessToken, wantSTS: []string{"ci-id-token"}},
+		"gcloud's file":    {url: "gs://bucket", gcloud: true, wantAuth: "Bearer " + fakeAccessToken, wantSTS: []string{"ci-id-token"}},
 	}
 
 	for name, tc := range tests {
@@ -147,6 +151,26 @@ func TestOpenBucket_GCSDoesNotWaitForTheMetadataServer(t *testing.T) {
 			t.Setenv("GCE_METADATA_HOST", "10.255.255.1")
 			t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credsFile)
 			t.Setenv("STORAGE_EMULATOR_HOST", "")
+			if tc.gcloud {
+				home := t.TempDir()
+				t.Setenv("HOME", home)
+				t.Setenv("APPDATA", home)
+				dir := filepath.Join(home, ".config", "gcloud")
+				if runtime.GOOS == "windows" {
+					dir = filepath.Join(home, "gcloud")
+				}
+				creds, err := os.ReadFile(credsFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "application_default_credentials.json"), creds, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+			}
 
 			fake := &fakeGoogle{}
 			transport := http.DefaultTransport
@@ -241,5 +265,99 @@ func TestOpenBucket_GCSWithoutCredentials(t *testing.T) {
 	}
 	if len(fake.storageAuth) != 0 {
 		t.Errorf("sent %d storage requests without credentials", len(fake.storageAuth))
+	}
+}
+
+// withoutCredentialsFiles leaves Application Default Credentials nothing but
+// the metadata server at host.
+func withoutCredentialsFiles(t *testing.T, metadataHost string) {
+	t.Helper()
+	t.Setenv("GCE_METADATA_HOST", metadataHost)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("APPDATA", t.TempDir())
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+}
+
+// Without a credentials file, credentials come from the metadata server.
+// Opening the bucket happens before gobuildcache answers the go command, and
+// nothing bounds it, so it mustn't wait on the metadata server, which job
+// containers often can't reach; the startup check bounds the token request.
+func TestOpenBucket_GCSMetadataCredentialsUnreachable(t *testing.T) {
+	quickStartup(t, 200*time.Millisecond)
+	metadata := newSilentListener(t)
+	withoutCredentialsFiles(t, metadata.Addr().String())
+
+	start := time.Now()
+	underlying, err := openBucket(context.Background(), "gs://bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("opening the bucket took %v", took)
+	}
+	// the listener counts connections as it accepts them
+	time.Sleep(50 * time.Millisecond)
+	if got := metadata.accepted.Load(); got != 0 {
+		t.Errorf("opening the bucket connected to the metadata server %d times", got)
+	}
+
+	b := checkedBucket(t, underlying, t.TempDir())
+	start = time.Now()
+	if outputID, _, err := b.OutputIDFromAction(context.Background(), someAction); outputID != "" || err != nil {
+		t.Errorf("lookup = %q, %v; want a miss", outputID, err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("lookup took %v, want about the startup timeout", took)
+	}
+	if b.remote.allow() {
+		t.Error("bucket still in use")
+	}
+}
+
+func TestOpenBucket_GCSMetadataCredentials(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	metadata := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+
+		w.Header().Set("Metadata-Flavor", "Google")
+		if r.Header.Get("Metadata-Flavor") != "Google" || r.URL.Path != "/computeMetadata/v1/instance/service-accounts/default/token" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"access_token":"metadata-token","expires_in":3600,"token_type":"Bearer"}`)
+	}))
+	t.Cleanup(metadata.Close)
+	withoutCredentialsFiles(t, strings.TrimPrefix(metadata.URL, "http://"))
+
+	// the metadata client has its own transport, so only storage requests
+	// come here
+	fake := &fakeGoogle{}
+	transport := http.DefaultTransport
+	http.DefaultTransport = fake
+	t.Cleanup(func() { http.DefaultTransport = transport })
+
+	bucket, err := openBucket(context.Background(), "gs://bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bucket.Close()
+	if _, err := bucket.Attributes(context.Background(), "action/"+strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.storageAuth) != 1 || fake.storageAuth[0] != "Bearer metadata-token" {
+		t.Errorf("storage requests' Authorization = %q, want the metadata server's token", fake.storageAuth)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 1 {
+		t.Errorf("metadata requests = %q, want only the token", paths)
 	}
 }
