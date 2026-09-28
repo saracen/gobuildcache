@@ -55,7 +55,9 @@ func retryable(err error) bool {
 // errors already did so within the attempt, some until its timeout, so
 // every call in flight would otherwise take several timeouts to fail, and
 // the breaker several such calls to trip. Turning the bucket off also ends
-// the attempts still in flight.
+// the attempts still in flight. So does an attempt the SDK spent retrying
+// answers, such as 503s, until its timeout, for this process only (see
+// retriedAnswers).
 func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(context.Context) error) error {
 	delay := retryDelay
 
@@ -69,8 +71,13 @@ func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(c
 		stop()
 		cancel()
 
-		if unreachable(err) && ctx.Err() == nil {
-			b.remote.tripUnreachable(err)
+		if ctx.Err() == nil {
+			switch {
+			case unreachable(err):
+				b.remote.tripUnreachable(err)
+			case retriedAnswers(err):
+				b.remote.trip(err)
+			}
 		}
 		if err == nil || !retryable(err) || attempt >= maxAttempts || ctx.Err() != nil || !b.remote.allow() {
 			return err

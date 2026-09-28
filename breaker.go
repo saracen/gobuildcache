@@ -70,7 +70,8 @@ func (b *breaker) record(err error) {
 }
 
 // trip turns the bucket off for the rest of this process. The failures that
-// trip it take a process at most a few quick calls to find, so they aren't
+// trip it take a process at most a few quick calls, or one attempt, to find,
+// and come from a bucket or token service that answers, so they aren't
 // shared: sharing them would turn the bucket off for the rest of a CI job
 // over something as brief as a token service failing for a couple of
 // seconds.

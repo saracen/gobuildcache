@@ -23,6 +23,7 @@ import (
 	"gocloud.dev/blob/gcsblob"
 	"gocloud.dev/blob/memblob"
 	"gocloud.dev/gcp"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -599,6 +600,88 @@ func TestBreaker_MarkerWrittenMidJobTurnsTheBucketOff(t *testing.T) {
 	}
 }
 
+// unavailable answers every request with 503, which the GCS client retries
+// until its context ends, then reports with the last answer it got.
+func unavailable(r *http.Request) (*http.Response, error) {
+	return gcsStatus(r, http.StatusServiceUnavailable)
+}
+
+// A bucket answering errors past the startup check's bound is answering, so
+// it mustn't be taken as unreachable, which would turn it off for the whole
+// job. The process that saw it gives up without sharing that.
+func TestStartup_ServerErrorsPastTheBoundAreNotShared(t *testing.T) {
+	quickStartup(t, 200*time.Millisecond)
+	fastRetries(t, 300*time.Millisecond)
+
+	dir := t.TempDir()
+	transport := &scriptedGCS{respond: unavailable}
+	b := newCheckedBucket(t, transport, dir)
+
+	start := time.Now()
+	if outputID, _, err := b.OutputIDFromAction(context.Background(), someAction); outputID != "" || err != nil {
+		t.Errorf("lookup = %q, %v; want a miss", outputID, err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("lookup took %v, want about the startup timeout", took)
+	}
+	if transport.probes.Load() == 0 {
+		t.Fatal("the check made no requests")
+	}
+	if b.remote.allow() {
+		t.Error("bucket still in use after the check spent its bound on errors")
+	}
+	if _, err := os.Stat(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("server errors shared as unreachability: %v", err)
+	}
+
+	// another process sharing the local cache checks for itself
+	other := newCheckedBucket(t, &scriptedGCS{respond: notFound}, dir)
+	if _, _, err := other.OutputIDFromAction(context.Background(), someAction); err != nil {
+		t.Error(err)
+	}
+	if !other.remote.allow() {
+		t.Error("bucket turned off for another process")
+	}
+}
+
+// The same for errors past an attempt's timeout once the process is using
+// the bucket, which it gives up on at the first such attempt rather than
+// retrying it.
+func TestBreaker_ServerErrorsPastTheAttemptTimeoutAreNotShared(t *testing.T) {
+	quickStartup(t, time.Second)
+	fastRetries(t, 300*time.Millisecond)
+
+	var brownout atomic.Bool
+	transport := &scriptedGCS{respond: func(r *http.Request) (*http.Response, error) {
+		if brownout.Load() {
+			return unavailable(r)
+		}
+		return notFound(r)
+	}}
+	b := newCheckedBucket(t, transport, t.TempDir())
+	if _, _, err := b.OutputIDFromAction(context.Background(), someAction); err != nil {
+		t.Fatal(err)
+	}
+
+	brownout.Store(true)
+	start := time.Now()
+	if _, _, err := b.OutputIDFromAction(context.Background(), strings.Repeat("c", 64)); err == nil {
+		t.Error("lookup of a bucket answering 503 succeeded")
+	}
+	if took := time.Since(start); took > 2*metadataTimeout {
+		t.Errorf("lookup took %v, want about one attempt's timeout", took)
+	}
+	if got := b.stats.Retries.Load(); got != 0 {
+		t.Errorf("retries = %d, want the first attempt to give up on the bucket", got)
+	}
+	if b.remote.allow() {
+		t.Error("bucket still in use")
+	}
+	if _, err := os.Stat(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("server errors shared as unreachability: %v", err)
+	}
+}
+
 // Errors that answer, such as an unauthorized anonymous caller, aren't
 // unreachability. The check leaves them to the process's own calls, which
 // count towards the breaker as usual.
@@ -692,6 +775,7 @@ func TestUnreachable(t *testing.T) {
 	refused := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 	reset := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
 	noHost := &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}
+	unavailableErr := &googleapi.Error{Code: http.StatusServiceUnavailable, Message: "Service Unavailable"}
 
 	tests := map[string]struct {
 		err  error
@@ -699,7 +783,7 @@ func TestUnreachable(t *testing.T) {
 	}{
 		"nil":                {nil, false},
 		"not found":          {notFound, false},
-		"server error":       {errors.New("googleapi: Error 503: Service Unavailable"), false},
+		"server error":       {unavailableErr, false},
 		"deadline":           {context.DeadlineExceeded, true},
 		"wrapped deadline":   {fmt.Errorf("lookup: %w", context.DeadlineExceeded), true},
 		"connection refused": {fmt.Errorf("Get: %w", refused), true},
@@ -710,12 +794,40 @@ func TestUnreachable(t *testing.T) {
 		"canceled":           {context.Canceled, false},
 		// as the GCS client reports a call canceled while it retried
 		"canceled retrying refused": {fmt.Errorf("retry failed with %w; last error: %w", context.Canceled, refused), false},
+		// and one that ran out of time retrying answers
+		"deadline retrying 503": {fmt.Errorf("retry failed with %w; last error: %w", context.DeadlineExceeded, unavailableErr), false},
+		"deadline retrying 429": {fmt.Errorf("retry failed with %w; last error: %w", context.DeadlineExceeded, &googleapi.Error{Code: http.StatusTooManyRequests}), false},
 	}
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			if got := unreachable(tc.err); got != tc.want {
 				t.Errorf("unreachable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRetriedAnswers(t *testing.T) {
+	unavailableErr := &googleapi.Error{Code: http.StatusServiceUnavailable}
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+
+	tests := map[string]struct {
+		err  error
+		want bool
+	}{
+		"nil":                    {nil, false},
+		"server error":           {unavailableErr, false},
+		"deadline":               {context.DeadlineExceeded, false},
+		"deadline retrying 503":  {fmt.Errorf("retry failed with %w; last error: %w", context.DeadlineExceeded, unavailableErr), true},
+		"deadline retrying dial": {fmt.Errorf("retry failed with %w; last error: %w", context.DeadlineExceeded, refused), false},
+		"canceled retrying 503":  {fmt.Errorf("retry failed with %w; last error: %w", context.Canceled, unavailableErr), false},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := retriedAnswers(tc.err); got != tc.want {
+				t.Errorf("retriedAnswers(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"gocloud.dev/gcerrors"
+	"google.golang.org/api/googleapi"
 )
 
 const (
@@ -32,6 +33,12 @@ const (
 	// probeKey is looked up to check the bucket is usable. Nothing writes
 	// it, so a working bucket answers not found.
 	probeKey = "gobuildcache-probe"
+
+	// probeGrace is how long the startup check waits, once startupTimeout
+	// is up, for the lookup's own error, which shows whether the bucket
+	// answered: the GCS client returns the last answer it retried as soon as
+	// its context ends, unless it's waiting on a token exchange.
+	probeGrace = 100 * time.Millisecond
 )
 
 // startupTimeout bounds the check of the bucket before a process first uses
@@ -84,7 +91,9 @@ func (b *breaker) checkMarker() {
 
 // checkRemote turns the bucket off if another process sharing the local cache
 // recently found it unreachable, and otherwise looks up probeKey, turning it
-// off if that fails to connect, resolve or answer within startupTimeout.
+// off if that fails to connect, resolve or answer within startupTimeout. If
+// the bucket answered, but with errors the SDK retried until then, it's
+// turned off for this process only (see retriedAnswers).
 //
 // Any other answer is left to the process's own calls, which count towards
 // the breaker as usual: looking up a key nothing writes only shows whether
@@ -97,8 +106,11 @@ func (b *Bucket) checkRemote() {
 		return
 	}
 
-	if err := b.probe(); unreachable(err) {
+	switch err := b.probe(); {
+	case unreachable(err):
 		b.remote.tripUnreachable(fmt.Errorf("checking bucket: %w", err))
+	case retriedAnswers(err):
+		b.remote.trip(fmt.Errorf("checking bucket: %w", err))
 	}
 }
 
@@ -123,6 +135,12 @@ func (b *Bucket) probe() error {
 	case err := <-result:
 		return err
 	case <-ctx.Done():
+	}
+
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(probeGrace):
 		return fmt.Errorf("no answer within %v: %w", startupTimeout, ctx.Err())
 	}
 }
@@ -134,9 +152,12 @@ func (b *Bucket) probe() error {
 // being canceled, even if what it was retrying was a failure to connect.
 // Errors that SDKs flatten into text, such as a failed token exchange,
 // aren't recognised either, and count towards the breaker as other errors
-// do.
+// do. Nor is running out of time retrying answers (see retriedAnswers).
 func unreachable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || gcerrors.Code(err) == gcerrors.Canceled {
+		return false
+	}
+	if answered(err) {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || gcerrors.Code(err) == gcerrors.DeadlineExceeded {
@@ -218,6 +239,29 @@ func reachEnv(name, value string) string {
 		}
 	}
 	return value
+}
+
+// answered reports whether err holds an answer from the bucket's service.
+//
+// Of the SDKs, only the GCS client keeps the answer it was retrying when its
+// context ends. The S3 and Azure clients retry a few times, with short waits,
+// and return the answer, or on a context ending return only its error, which
+// can't be told from a call nothing answered.
+func answered(err error) bool {
+	var apiErr *googleapi.Error
+	return errors.As(err, &apiErr)
+}
+
+// retriedAnswers reports whether err is from an SDK that retried answers
+// until its context ended, such as the GCS client retrying 503s or 429s.
+//
+// The bucket answered, so this isn't unreachability, which is shared with
+// the job's other go commands: the client waits up to 30s between tries, so
+// a few seconds of 503s can outlast an attempt, and sharing that would turn
+// the bucket off for 10 minutes. But the process gives up on the bucket
+// rather than retrying, since each attempt would take its whole timeout.
+func retriedAnswers(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && answered(err)
 }
 
 // readRemoteDisabled returns when the marker was written and why, if it was
