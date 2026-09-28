@@ -17,25 +17,11 @@ import (
 // populates a bucket, then a second "machine" with an empty local cache must
 // get every build and test result from the bucket.
 func TestEndToEnd(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds with the go toolchain")
-	}
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Skip("go toolchain not found")
-	}
-
 	tmp := t.TempDir()
-	bin := filepath.Join(tmp, "gobuildcache")
-	if runtime.GOOS == "windows" {
-		bin += ".exe"
-	}
-	if out, err := exec.Command(goBin, "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("building gobuildcache: %v\n%s", err, out)
-	}
+	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
 
 	mod := filepath.Join(tmp, "mod")
-	writeFiles(t, mod, map[string]string{
+	writeModule(t, mod, map[string]string{
 		"go.mod":               "module example.com/e2e\n\ngo 1.24\n",
 		"lib/lib.go":           "package lib\n\nfunc Add(a, b int) int { return a + b }\n",
 		"lib/lib_test.go":      "package lib\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n",
@@ -43,42 +29,12 @@ func TestEndToEnd(t *testing.T) {
 		"cmd/app/main_test.go": "package main\n\nimport \"testing\"\n\nfunc TestMain(t *testing.T) {}\n",
 	})
 
-	// The go command doesn't cache its index of a directory whose files were
-	// modified moments ago, so without this every run misses on those. CI
-	// systems wanting remote cache hits need stable, old mtimes for the same
-	// reason (they also key test results that read files).
-	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	err = filepath.WalkDir(mod, func(p string, _ fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		return os.Chtimes(p, old, old)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bucketURL := "file://" + filepath.ToSlash(filepath.Join(tmp, "bucket"))
-	if runtime.GOOS == "windows" {
-		bucketURL = "file:///" + filepath.ToSlash(filepath.Join(tmp, "bucket"))
-	}
-	if err := os.MkdirAll(filepath.Join(tmp, "bucket"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
 	goTest := func(name string, flags ...string) (string, map[string]int64) {
 		t.Helper()
 
-		prog := append([]string{bin, "-stats", "-dir", filepath.Join(tmp, name)}, flags...)
 		cmd := exec.Command(goBin, "test", "./...")
 		cmd.Dir = mod
-		cmd.Env = append(os.Environ(),
-			"GOCACHEPROG="+strings.Join(append(prog, bucketURL), " "),
-			"GOCACHE="+filepath.Join(tmp, name+"-gocache"),
-			"GOFLAGS=",
-			"GOWORK=off",
-			"GOTOOLCHAIN=local",
-		)
+		cmd.Env = jobEnv(tmp, name, bin, bucketURL, append([]string{"-stats"}, flags...)...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("%s: go test: %v\n%s", name, err, out)
@@ -109,15 +65,149 @@ func TestEndToEnd(t *testing.T) {
 	// to the cache and reads it back, which needs puts even when readonly.
 	cmd := exec.Command(goBin, "list", "-e", "-test", "-compiled", "-f", "{{if .Error}}{{.ImportPath}}: {{.Error}}{{end}}", "./...")
 	cmd.Dir = mod
-	cmd.Env = append(os.Environ(),
-		"GOCACHEPROG="+strings.Join([]string{bin, "-readonly", "-dir", filepath.Join(tmp, "lister"), bucketURL}, " "),
-		"GOCACHE="+filepath.Join(tmp, "lister-gocache"),
+	cmd.Env = jobEnv(tmp, "lister", bin, bucketURL, "-readonly")
+	if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "" {
+		t.Errorf("go list -test -compiled with -readonly: %v\n%s", err, out)
+	}
+}
+
+// TestEndToEnd_CleanTestcache checks that "go clean -testcache" expires test
+// results from the bucket, which the go command does by the time they were
+// put, and that the results of rerunning them are stored for later jobs.
+func TestEndToEnd_CleanTestcache(t *testing.T) {
+	tmp := t.TempDir()
+	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
+
+	// The test's output is different every time it runs, but not what the go
+	// command keys its result on, so the output shows which run a cached
+	// result is from.
+	mod := filepath.Join(tmp, "mod")
+	writeModule(t, mod, map[string]string{
+		"go.mod":        "module example.com/stamp\n\ngo 1.24\n",
+		"stamp_test.go": "package stamp\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestStamp(t *testing.T) { fmt.Printf(\"stamp %d\\n\", time.Now().UnixNano()) }\n",
+	})
+
+	stampLine := regexp.MustCompile(`(?m)^stamp (\d+)$`)
+
+	// job runs the test in a fresh job, with its own local cache and GOCACHE,
+	// returning which run's result it got and whether it was cached.
+	job := func(name string, clean bool) (string, bool, map[string]int64) {
+		t.Helper()
+
+		env := jobEnv(tmp, name, bin, bucketURL, "-stats")
+		if clean {
+			// go clean -testcache silently does nothing without GOCACHE
+			if err := os.MkdirAll(filepath.Join(tmp, name+"-gocache"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(goBin, "clean", "-testcache")
+			cmd.Dir = mod
+			cmd.Env = env
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%s: go clean -testcache: %v\n%s", name, err, out)
+			}
+		}
+
+		cmd := exec.Command(goBin, "test", "-v", "./...")
+		cmd.Dir = mod
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: go test: %v\n%s", name, err, out)
+		}
+		m := stampLine.FindStringSubmatch(string(out))
+		if m == nil {
+			t.Fatalf("%s: no stamp in output:\n%s", name, out)
+		}
+		return m[1], strings.Contains(string(out), "(cached)"), parseStats(t, string(out))
+	}
+
+	first, cached, _ := job("first", false)
+	if cached {
+		t.Fatal("first job's test result was cached")
+	}
+
+	if got, cached, _ := job("before-rerun", false); !cached || got != first {
+		t.Errorf("job without go clean: cached=%v from run %s, want cached from the first run %s", cached, got, first)
+	}
+
+	rerun, cached, stats := job("clean", true)
+	if cached || rerun == first {
+		t.Fatalf("job after go clean -testcache: cached=%v from run %s, want a rerun", cached, rerun)
+	}
+	if stats["uploads"] == 0 || stats["upload_errors"] != 0 {
+		t.Errorf("rerun wasn't stored: %v", stats)
+	}
+
+	if got, cached, _ := job("later", false); !cached || got != rerun {
+		t.Errorf("later job: cached=%v from run %s, want cached from the rerun %s", cached, got, rerun)
+	}
+}
+
+// setupEndToEnd builds gobuildcache into tmp and creates a file:// bucket
+// there, returning the go command, gobuildcache and the bucket's URL.
+func setupEndToEnd(t *testing.T, tmp string) (string, string, string) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("builds with the go toolchain")
+	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go toolchain not found")
+	}
+
+	bin := filepath.Join(tmp, "gobuildcache")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	if out, err := exec.Command(goBin, "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("building gobuildcache: %v\n%s", err, out)
+	}
+
+	bucketURL := "file://" + filepath.ToSlash(filepath.Join(tmp, "bucket"))
+	if runtime.GOOS == "windows" {
+		bucketURL = "file:///" + filepath.ToSlash(filepath.Join(tmp, "bucket"))
+	}
+	if err := os.MkdirAll(filepath.Join(tmp, "bucket"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	return goBin, bin, bucketURL
+}
+
+// jobEnv is the environment of go commands in a job named name, which has its
+// own local cache and GOCACHE, sharing the bucket with other jobs.
+func jobEnv(tmp, name, bin, bucketURL string, flags ...string) []string {
+	prog := append([]string{bin, "-dir", filepath.Join(tmp, name)}, flags...)
+	return append(os.Environ(),
+		"GOCACHEPROG="+strings.Join(append(prog, bucketURL), " "),
+		"GOCACHE="+filepath.Join(tmp, name+"-gocache"),
 		"GOFLAGS=",
 		"GOWORK=off",
 		"GOTOOLCHAIN=local",
 	)
-	if out, err := cmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "" {
-		t.Errorf("go list -test -compiled with -readonly: %v\n%s", err, out)
+}
+
+// writeModule writes a module's files with old modification times.
+func writeModule(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+
+	writeFiles(t, root, files)
+
+	// The go command doesn't cache its index of a directory whose files were
+	// modified moments ago, so without this every run misses on those. CI
+	// systems wanting remote cache hits need stable, old mtimes for the same
+	// reason (they also key test results that read files).
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	err := filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(p, old, old)
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

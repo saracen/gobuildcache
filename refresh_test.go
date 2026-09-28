@@ -3,15 +3,23 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/fileblob"
+	"gocloud.dev/blob/s3blob"
 )
 
 // newFileBucket returns a Bucket backed by a fileblob bucket, whose object
@@ -33,8 +41,8 @@ func newFileBucket(t *testing.T, readonly bool) (*Bucket, *blob.Bucket, string) 
 	return b, underlying, dir
 }
 
-// seed puts an action link and its output in the bucket, last written at
-// modTime.
+// seed puts an action link and its output in the bucket, put and last
+// written at modTime.
 func seed(t *testing.T, underlying *blob.Bucket, dir, actionID string, content []byte, modTime time.Time) string {
 	t.Helper()
 	ctx := context.Background()
@@ -44,7 +52,7 @@ func seed(t *testing.T, underlying *blob.Bucket, dir, actionID string, content [
 		t.Fatal(err)
 	}
 	if err := underlying.WriteAll(ctx, path.Join(actionDir, actionID), nil, &blob.WriterOptions{
-		Metadata:    map[string]string{"output_id": outputID},
+		Metadata:    map[string]string{"output_id": outputID, putTimeKey: strconv.FormatInt(modTime.UnixNano(), 10)},
 		ContentType: "text/plain",
 	}); err != nil {
 		t.Fatal(err)
@@ -88,7 +96,7 @@ func TestRefresh_OldObjectsAreRefreshedOnHit(t *testing.T) {
 	b, underlying, dir := newFileBucket(t, false)
 
 	actionID := strings.Repeat("a", 64)
-	old := time.Now().Add(-48 * time.Hour)
+	old := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
 	outputID := seed(t, underlying, dir, actionID, []byte("popular"), old)
 
 	getThroughCacher(t, b, actionID)
@@ -108,11 +116,85 @@ func TestRefresh_OldObjectsAreRefreshedOnHit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attrs.Metadata["output_id"] != outputID {
+	if attrs.Metadata["output_id"] != outputID || attrs.Metadata[putTimeKey] != strconv.FormatInt(old.UnixNano(), 10) {
 		t.Errorf("action metadata after refresh = %v", attrs.Metadata)
 	}
 	if got, _ := underlying.ReadAll(context.Background(), path.Join(outputDir, outputID)); string(got) != "popular" {
 		t.Errorf("output after refresh = %q", got)
+	}
+
+	// refreshing isn't putting
+	if got, err := b.disk.PutTime(actionID); err != nil || !got.Equal(old) {
+		t.Errorf("put time = %v, %v; want %v", got, err, old)
+	}
+}
+
+// TestRefresh_S3KeepsPutTime checks that refreshing an action link on S3,
+// which replaces its metadata, replaces it with the put time too.
+func TestRefresh_S3KeepsPutTime(t *testing.T) {
+	actionID := strings.Repeat("a", 64)
+	outputID := strings.Repeat("b", 64)
+	putTime := strconv.FormatInt(time.Now().Add(-48*time.Hour).UnixNano(), 10)
+
+	var mu sync.Mutex
+	var copied http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bucket/"+path.Join(actionDir, actionID) {
+			http.NotFound(w, r)
+			return
+		}
+		switch {
+		case r.Method == http.MethodHead:
+			w.Header().Set("Last-Modified", time.Now().Add(-48*time.Hour).UTC().Format(http.TimeFormat))
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Amz-Meta-Output_id", outputID)
+			w.Header().Set("X-Amz-Meta-Put_time", putTime)
+		case r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "":
+			mu.Lock()
+			copied = r.Header.Clone()
+			mu.Unlock()
+			io.WriteString(w, `<CopyObjectResult><ETag>"x"</ETag></CopyObjectResult>`)
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := s3.New(s3.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(srv.URL),
+		UsePathStyle: true,
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "id", SecretAccessKey: "secret"}, nil
+		}),
+	})
+	underlying, err := s3blob.OpenBucket(context.Background(), client, "bucket", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { underlying.Close() })
+
+	b := &Bucket{disk: newDisk(t), bucket: underlying, refreshAfter: time.Hour}
+	b.Start(context.Background())
+	if got, err := b.OutputIDFromAction(context.Background(), actionID); err != nil || got != outputID {
+		t.Fatalf("OutputIDFromAction = %q, %v", got, err)
+	}
+	b.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if copied == nil {
+		t.Fatalf("action link wasn't refreshed by copying: %d refreshes, %d errors", b.stats.Refreshes.Load(), b.stats.RefreshErrors.Load())
+	}
+	if got := copied.Get("X-Amz-Metadata-Directive"); got != "REPLACE" {
+		t.Errorf("metadata directive = %q, want REPLACE", got)
+	}
+	if got := copied.Get("X-Amz-Meta-Output_id"); got != outputID {
+		t.Errorf("copied output_id = %q, want %q", got, outputID)
+	}
+	if got := copied.Get("X-Amz-Meta-Put_time"); got != putTime {
+		t.Errorf("copied put_time = %q, want %q", got, putTime)
 	}
 }
 

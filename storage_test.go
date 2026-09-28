@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -148,7 +150,7 @@ func TestDiskLinkActionToOutput(t *testing.T) {
 	actionID := strings.Repeat("a", 64)
 	outputID := strings.Repeat("b", 64)
 
-	exists, err := d.LinkActionToOutput(ctx, actionID, outputID)
+	exists, err := d.LinkActionToOutput(ctx, actionID, outputID, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +167,7 @@ func TestDiskLinkActionToOutput(t *testing.T) {
 	}
 
 	// Idempotent for unchanged target.
-	exists, err = d.LinkActionToOutput(ctx, actionID, outputID)
+	exists, err = d.LinkActionToOutput(ctx, actionID, outputID, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +177,7 @@ func TestDiskLinkActionToOutput(t *testing.T) {
 
 	// Replaces symlink when target changes.
 	newOutput := strings.Repeat("c", 64)
-	exists, err = d.LinkActionToOutput(ctx, actionID, newOutput)
+	exists, err = d.LinkActionToOutput(ctx, actionID, newOutput, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +190,39 @@ func TestDiskLinkActionToOutput(t *testing.T) {
 	}
 	if got != newOutput {
 		t.Errorf("got %q, want %q after relink", got, newOutput)
+	}
+}
+
+func TestDiskLinkActionToOutput_RecordsPutTime(t *testing.T) {
+	d := newDisk(t)
+	ctx := context.Background()
+
+	actionID := strings.Repeat("a", 64)
+	outputID := strings.Repeat("b", 64)
+
+	first := time.Unix(1700000000, 0)
+	if _, err := d.LinkActionToOutput(ctx, actionID, outputID, first); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := d.PutTime(actionID); err != nil || !got.Equal(first) {
+		t.Errorf("PutTime = %v, %v; want %v", got, err, first)
+	}
+
+	// the same entry put again is newer
+	second := first.Add(time.Hour)
+	exists, err := d.LinkActionToOutput(ctx, actionID, outputID, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("expected exists=true for an unchanged link")
+	}
+	if got, err := d.PutTime(actionID); err != nil || !got.Equal(second) {
+		t.Errorf("PutTime after re-put = %v, %v; want %v", got, err, second)
+	}
+
+	if _, err := d.PutTime(strings.Repeat("c", 64)); err == nil {
+		t.Error("expected an error for an action that isn't linked")
 	}
 }
 
@@ -480,6 +515,104 @@ func TestBucketOutputIDFromAction_FromMetadata(t *testing.T) {
 	}
 }
 
+func TestBucketOutputIDFromAction_RestoresPutTime(t *testing.T) {
+	putTime := time.Unix(1700000000, 0)
+
+	tests := map[string]struct {
+		metadata map[string]string
+		want     time.Time
+	}{
+		"recorded":           {map[string]string{putTimeKey: strconv.FormatInt(putTime.UnixNano(), 10)}, putTime},
+		"uploaded before it": {nil, unknownPutTime},
+		"invalid":            {map[string]string{putTimeKey: "yesterday"}, unknownPutTime},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			b, underlying := newBucket(t)
+
+			actionID := strings.Repeat("a", 64)
+			outputID := strings.Repeat("b", 64)
+			metadata := map[string]string{"output_id": outputID}
+			maps.Copy(metadata, tc.metadata)
+			if err := underlying.Upload(ctx, path.Join(actionDir, actionID), bytes.NewReader(nil), &blob.WriterOptions{
+				ContentType: "text/plain",
+				Metadata:    metadata,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			if got, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
+				t.Fatalf("OutputIDFromAction = %q, %v", got, err)
+			}
+			if got, err := b.disk.PutTime(actionID); err != nil || !got.Equal(tc.want) {
+				t.Errorf("PutTime = %v, %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBucketLinkActionToOutput_RePutUploadsNewPutTime(t *testing.T) {
+	ctx := context.Background()
+	underlying := memblob.OpenBucket(nil)
+	t.Cleanup(func() { underlying.Close() })
+
+	content := []byte("test result")
+	outputID := hashID(content)
+	actionID := strings.Repeat("a", 64)
+	key := path.Join(actionDir, actionID)
+
+	old := time.Unix(1700000000, 0)
+	if err := underlying.WriteAll(ctx, path.Join(outputDir, outputID), content, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := underlying.WriteAll(ctx, key, nil, &blob.WriterOptions{
+		Metadata: map[string]string{"output_id": outputID, putTimeKey: strconv.FormatInt(old.UnixNano(), 10)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The go command gets the entry, rejects it as an expired test result,
+	// reruns the test and puts the same output again.
+	b := &Bucket{disk: newDisk(t), bucket: underlying}
+	b.Start(ctx)
+	if got, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
+		t.Fatalf("OutputIDFromAction = %q, %v", got, err)
+	}
+	if _, err := b.GetOutput(ctx, outputID); err != nil {
+		t.Fatal(err)
+	}
+	exists, err := b.LinkActionToOutput(ctx, actionID, outputID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("expected exists=true for an unchanged link")
+	}
+	b.Close()
+
+	local, err := b.disk.PutTime(actionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !local.After(old) {
+		t.Errorf("local put time = %v, want after %v", local, old)
+	}
+
+	attrs, err := underlying.Attributes(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, err := strconv.ParseInt(attrs.Metadata[putTimeKey], 10, 64)
+	if err != nil {
+		t.Fatalf("bucket put time: %v", err)
+	}
+	if uploaded := time.Unix(0, ns); !uploaded.After(old) || local.Sub(uploaded).Abs() > time.Second {
+		t.Errorf("bucket put time = %v, want the re-put's, %v", uploaded, local)
+	}
+}
+
 func TestBucketOutputIDFromAction_EmptyMetadata(t *testing.T) {
 	ctx := context.Background()
 	b, underlying := newBucket(t)
@@ -570,7 +703,7 @@ func TestBucketLinkActionToOutput(t *testing.T) {
 		t.Error("expected exists=false on first link")
 	}
 
-	// Idempotent path skips the bucket upload but still reports exists=true.
+	// Putting it again reports exists=true.
 	exists, err = b.LinkActionToOutput(ctx, actionID, outputID)
 	if err != nil {
 		t.Fatal(err)
@@ -614,7 +747,7 @@ func TestDiskLinkActionToOutput_WritesFile(t *testing.T) {
 	actionID := strings.Repeat("a", 64)
 	outputID := strings.Repeat("b", 64)
 
-	if _, err := d.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+	if _, err := d.LinkActionToOutput(ctx, actionID, outputID, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -648,7 +781,7 @@ func TestDiskOutputIDFromAction_LegacySymlink(t *testing.T) {
 
 	// Relinking replaces the legacy symlink with a file.
 	newOutput := strings.Repeat("c", 64)
-	if _, err := d.LinkActionToOutput(ctx, actionID, newOutput); err != nil {
+	if _, err := d.LinkActionToOutput(ctx, actionID, newOutput, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := d.OutputIDFromAction(ctx, actionID); got != newOutput {

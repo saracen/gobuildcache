@@ -40,6 +40,13 @@ Fresh checkouts won't hit the cache if files have new modification times:
 
 Set every checked-out file's modification time to something stable and in the past, such as a time derived from the file's contents, before running `go`.
 
+## rerunning cached tests
+
+`go clean -testcache` expires the test results put before it ran, including ones from the bucket, so a job can rerun every test and, unless it's `-readonly`, store the results for jobs that don't. The go command decides by the time an entry was put, so gobuildcache records it on each action link it uploads (`put_time` metadata) and reports that, not when the entry was downloaded. Refreshing an entry keeps its put time.
+
+- `go clean -testcache` silently does nothing if `GOCACHE` doesn't exist yet, as in a fresh CI job, so create it first: `mkdir -p "$(go env GOCACHE)"`.
+- Entries uploaded by versions of gobuildcache that didn't record put times are always expired by `go clean -testcache`, because when they were put isn't known. Their modification time isn't used instead, since refreshing changes it. Results from rerunning them are stored with a put time.
+
 ## retries and timeouts
 
 Every bucket call is bounded and retried the same way whichever provider is behind it: up to 3 attempts with backoff, each limited to 30 seconds for lookups and small writes, or 5 minutes for transferring an output. The limit also bounds retries done inside a provider's SDK, which for some reads otherwise continue until their context ends.

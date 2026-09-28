@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"gocloud.dev/blob"
 	"gocloud.dev/blob/memblob"
 )
 
@@ -37,14 +38,20 @@ func TestFlagArray(t *testing.T) {
 
 func newCacher(t *testing.T) *Cacher {
 	t.Helper()
+	underlying := memblob.OpenBucket(nil)
+	t.Cleanup(func() { underlying.Close() })
+	return newCacherOn(t, underlying)
+}
+
+// newCacherOn returns a Cacher with its own local cache, using underlying.
+func newCacherOn(t *testing.T, underlying *blob.Bucket) *Cacher {
+	t.Helper()
 	dir := t.TempDir()
 	for _, sub := range []string{actionDir, outputDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	underlying := memblob.OpenBucket(nil)
-	t.Cleanup(func() { underlying.Close() })
 
 	c := &Cacher{disk: &Disk{cacheDir: dir}}
 	c.bucket = &Bucket{disk: c.disk, bucket: underlying}
@@ -116,9 +123,6 @@ func TestPopulateFileInfo(t *testing.T) {
 		}
 		if resp.Size != int64(len(content)) {
 			t.Errorf("Size=%d, want %d", resp.Size, len(content))
-		}
-		if resp.Time == nil {
-			t.Error("Time was nil")
 		}
 		if len(resp.OutputID) != 32 {
 			t.Errorf("OutputID len=%d, want 32", len(resp.OutputID))
@@ -192,6 +196,52 @@ func TestHandleRequest_Get(t *testing.T) {
 	}
 	if resp.Size != int64(len(content)) {
 		t.Errorf("Size=%d, want %d", resp.Size, len(content))
+	}
+}
+
+func TestHandleRequest_GetReportsPutTime(t *testing.T) {
+	ctx := context.Background()
+	underlying := memblob.OpenBucket(nil)
+	t.Cleanup(func() { underlying.Close() })
+
+	content := []byte("test result")
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+	get := &request{ID: 1, Command: cmdGet, ActionID: actionID}
+
+	writer := newCacherOn(t, underlying)
+	before := time.Now()
+	if resp := handleRequest(ctx, writer, &request{
+		ID: 2, Command: cmdPut, ActionID: actionID, OutputID: sha256Bytes(content),
+		Body: bytes.NewReader(content), BodySize: int64(len(content)),
+	}); resp.Err != "" {
+		t.Fatal(resp.Err)
+	}
+	after := time.Now()
+	writer.bucket.Close()
+
+	local := handleRequest(ctx, writer, get)
+	if local.Miss || local.Time == nil {
+		t.Fatalf("local get = %+v", local)
+	}
+	if local.Time.Before(before.Add(-time.Second)) || local.Time.After(after) {
+		t.Errorf("local get Time = %v, want the put, between %v and %v", local.Time, before, after)
+	}
+
+	// Another machine gets it from the bucket, and must see when it was put,
+	// not when it was downloaded, or "go clean -testcache" can't expire it.
+	time.Sleep(10 * time.Millisecond)
+	reader := newCacherOn(t, underlying)
+	remote := handleRequest(ctx, reader, get)
+	if remote.Miss || remote.Err != "" || remote.Time == nil {
+		t.Fatalf("remote get = %+v", remote)
+	}
+	if !remote.Time.Equal(*local.Time) {
+		t.Errorf("remote get Time = %v, want the put time %v", remote.Time, local.Time)
+	}
+
+	// and so do later gets, from its local cache
+	if again := handleRequest(ctx, reader, get); again.Time == nil || !again.Time.Equal(*local.Time) {
+		t.Errorf("second remote get Time = %v, want %v", again.Time, local.Time)
 	}
 }
 

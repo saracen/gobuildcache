@@ -295,6 +295,9 @@ func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
 		c.bucket.stats.Gets.Add(1)
 		now := time.Now()
 		resp.DiskPath, err = c.Get(ctx, req)
+		if err == nil && resp.DiskPath != "" {
+			resp.Time, err = c.putTime(req)
+		}
 		switch {
 		case err != nil:
 			c.bucket.stats.GetErrors.Add(1)
@@ -331,7 +334,18 @@ func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
 	return resp
 }
 
-// populateFileInfo fills Size/Time/OutputID from the on-disk artifact named by
+// putTime returns when a get hit's entry was put. The go command expires test
+// results put before the last "go clean -testcache" by it, so for an entry
+// from the bucket it must be the original put, not the download.
+func (c *Cacher) putTime(req *request) (*time.Time, error) {
+	t, err := c.disk.PutTime(hex.EncodeToString(req.ActionID))
+	if err != nil {
+		return nil, fmt.Errorf("getting put time: %w", err)
+	}
+	return &t, nil
+}
+
+// populateFileInfo fills Size/OutputID from the on-disk artifact named by
 // resp.DiskPath. Skipped for cmdClose (no disk path) and on cache miss
 // (empty DiskPath would otherwise produce a spurious stat error).
 func populateFileInfo(req *request, resp *response) {
@@ -348,8 +362,6 @@ func populateFileInfo(req *request, resp *response) {
 		resp.Err = "invalid output id"
 	}
 	resp.Size = fi.Size()
-	modTime := fi.ModTime()
-	resp.Time = &modTime
 }
 
 var originalStdout = os.Stdout

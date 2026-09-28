@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -27,7 +28,21 @@ const (
 	// suppresses re-checking. Long enough to prevent hammering during a single
 	// build, short enough that a freshly-uploaded entry becomes visible soon.
 	emptyMarkerTTL = 10 * time.Minute
+
+	// putTimeKey is the action link metadata holding when its entry was put,
+	// in Unix nanoseconds. It's on the link rather than the output because
+	// outputs are content addressed and shared by every action that produces
+	// the same bytes, each put at its own time.
+	putTimeKey = "put_time"
 )
+
+// unknownPutTime is reported for action links uploaded without a put time.
+// The go command only uses an entry's time to expire test results put before
+// the last "go clean -testcache", so a time before any of those makes them
+// always expire, rather than risk replaying a result that should rerun. The
+// object's modification time isn't a substitute: refreshing rewrites it, so
+// it can be later than a "go clean -testcache" that came after the put.
+var unknownPutTime = time.Unix(0, 0)
 
 // isValidID reports whether s is safe to use as a cache ID embedded in a
 // filesystem path. IDs we generate are lowercase hex from hex.EncodeToString;
@@ -96,6 +111,7 @@ type Bucket struct {
 type uploadJob struct {
 	actionID string
 	outputID string
+	putTime  time.Time
 }
 
 // queuedJob is one of the kinds of work done in the background.
@@ -187,14 +203,28 @@ func readActionLink(pathname string) (string, error) {
 	return string(bytes.TrimSpace(data)), nil
 }
 
-func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
+// PutTime returns when actionID's entry was put, which is its action link's
+// modification time.
+func (d *Disk) PutTime(actionID string) (time.Time, error) {
+	fi, err := os.Lstat(filepath.Join(d.cacheDir, actionDir, actionID))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return fi.ModTime(), nil
+}
+
+// LinkActionToOutput links actionID to outputID, recording that the entry was
+// put at putTime. It reports whether actionID was already linked to outputID,
+// but writes the link regardless: the same entry put again, such as a test
+// rerun after "go clean -testcache", has a new put time.
+func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string, putTime time.Time) (bool, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
 
-	if existing, err := readActionLink(actionPathname); err == nil && existing == outputID {
-		return true, nil
-	}
+	existing, err := readActionLink(actionPathname)
+	exists := err == nil && existing == outputID
 
-	// Write to a temporary file and rename, so readers never see a partial link.
+	// Write to a temporary file and rename, so readers never see a partial link
+	// or one with the wrong time.
 	f, err := os.CreateTemp(filepath.Join(d.cacheDir, actionDir), actionID+".tmp.*")
 	if err != nil {
 		return false, err
@@ -204,6 +234,9 @@ func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string
 	_, err = f.WriteString(outputID)
 	if cerr := f.Close(); err == nil {
 		err = cerr
+	}
+	if err == nil {
+		err = os.Chtimes(f.Name(), putTime, putTime)
 	}
 	if err != nil {
 		return false, err
@@ -218,7 +251,7 @@ func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string
 	if err := os.Rename(f.Name(), actionPathname); err != nil {
 		return false, err
 	}
-	return false, nil
+	return exists, nil
 }
 
 func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (string, error) {
@@ -279,16 +312,28 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		return "", fmt.Errorf("invalid output_id %q in bucket metadata for action %s", outputID, actionID)
 	}
 
+	putTime := unknownPutTime
+	metadata := map[string]string{"output_id": outputID}
+	if v, ok := attr.Metadata[putTimeKey]; ok {
+		if ns, err := strconv.ParseInt(v, 10, 64); err == nil {
+			putTime = time.Unix(0, ns)
+			// refreshing on S3 replaces the metadata, so it must carry this too
+			metadata[putTimeKey] = v
+		} else {
+			slog.Debug("invalid put time", "action", actionID, "put_time", v)
+		}
+	}
+
 	if b.shouldRefresh(attr.ModTime) {
 		b.scheduleRefresh(refreshJob{
 			key:         path.Join(actionDir, actionID),
-			metadata:    map[string]string{"output_id": outputID},
+			metadata:    metadata,
 			contentType: "text/plain",
 		})
 	}
 
 	slog.Debug("linking action to output from output from action", "action", actionID, "output", outputID)
-	if _, err := b.disk.LinkActionToOutput(ctx, actionID, outputID); err != nil {
+	if _, err := b.disk.LinkActionToOutput(ctx, actionID, outputID, putTime); err != nil {
 		slog.Warn("linking action to output", "action", actionID, "output", outputID, "err", err)
 	}
 
@@ -296,17 +341,21 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 }
 
 func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
-	exists, err := b.disk.LinkActionToOutput(ctx, actionID, outputID)
-	if err != nil || exists || b.readonly {
+	putTime := time.Now()
+	exists, err := b.disk.LinkActionToOutput(ctx, actionID, outputID, putTime)
+	if err != nil || b.readonly {
 		return exists, err
 	}
 
+	// An entry the go command puts again is uploaded again, even unchanged:
+	// it only puts what it has recomputed, such as a test rerun after "go
+	// clean -testcache", and others need the new put time to not expire it.
 	slog.Debug("scheduling upload", "action", actionID, "output", outputID)
-	if err := b.enqueue(queuedJob{upload: &uploadJob{actionID: actionID, outputID: outputID}}); err != nil {
+	if err := b.enqueue(queuedJob{upload: &uploadJob{actionID: actionID, outputID: outputID, putTime: putTime}}); err != nil {
 		return false, err
 	}
 
-	return false, nil
+	return exists, nil
 }
 
 func (b *Bucket) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
@@ -343,7 +392,10 @@ func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 
 	err := b.withRetry(ctx, metadataTimeout, func(ctx context.Context) error {
 		return b.bucket.Upload(ctx, path.Join(actionDir, job.actionID), bytes.NewReader(nil), &blob.WriterOptions{
-			Metadata:    map[string]string{"output_id": job.outputID},
+			Metadata: map[string]string{
+				"output_id": job.outputID,
+				putTimeKey:  strconv.FormatInt(job.putTime.UnixNano(), 10),
+			},
 			ContentType: "text/plain",
 		})
 	})
