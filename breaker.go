@@ -31,8 +31,9 @@ type breaker struct {
 	cancel  context.CancelFunc
 
 	// marker is where the bucket being unreachable is shared with other
-	// processes using the same local cache, since the go command starts one
-	// per invocation and each would otherwise find out for itself:
+	// processes using the same local cache and bucket (see remoteIdentity),
+	// since the go command starts one per invocation and each would
+	// otherwise find out for itself:
 	// tripUnreachable writes it, and it turns the bucket off in processes
 	// that start using it within remoteDisabledTTL, or that are using it
 	// when it's written (see checkMarker). Empty to not share it.

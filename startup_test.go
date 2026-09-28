@@ -78,6 +78,9 @@ func newCheckedBucket(t *testing.T, transport http.RoundTripper, dir string) *Bu
 	return checkedBucket(t, underlying, dir)
 }
 
+// testRemote identifies the bucket of checkedBucket's markers.
+const testRemote = "gs://bucket"
+
 // checkedBucket wraps underlying as serve does, checking it at startup and
 // sharing the result through dir.
 func checkedBucket(t *testing.T, underlying *blob.Bucket, dir string) *Bucket {
@@ -89,7 +92,7 @@ func checkedBucket(t *testing.T, underlying *blob.Bucket, dir string) *Bucket {
 		}
 	}
 	b := &Bucket{disk: &Disk{cacheDir: dir}, bucket: underlying}
-	b.remote.marker = filepath.Join(dir, remoteDisabledFile)
+	b.remote.marker = remoteDisabledMarker(dir, testRemote)
 	b.Start(context.Background())
 	t.Cleanup(b.Close)
 	return b
@@ -321,7 +324,7 @@ func TestStartup_LostDNSQueryKeepsTheBucket(t *testing.T) {
 
 func TestStartup_MarkerTurnsTheBucketOffForOtherProcesses(t *testing.T) {
 	dir := t.TempDir()
-	marker := filepath.Join(dir, remoteDisabledFile)
+	marker := remoteDisabledMarker(dir, testRemote)
 	if err := os.WriteFile(marker, []byte("checking bucket: dial tcp: connection refused\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -349,9 +352,91 @@ func TestStartup_MarkerTurnsTheBucketOffForOtherProcesses(t *testing.T) {
 	}
 }
 
+// A marker only turns off the bucket it was written for: processes sharing
+// the local cache can use other buckets, or reach the same one another way.
+func TestStartup_MarkerIsForItsBucket(t *testing.T) {
+	quickStartup(t, 200*time.Millisecond)
+	dir := t.TempDir()
+	unreachable := newCheckedBucket(t, &scriptedGCS{respond: func(*http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	}}, dir)
+	unreachable.remote.marker = remoteDisabledMarker(dir, remoteIdentity("gs://unreachable", ""))
+	unreachable.OutputIDFromAction(context.Background(), someAction)
+	if _, err := os.Stat(unreachable.remote.marker); err != nil {
+		t.Fatalf("marker: %v", err)
+	}
+
+	transport := &scriptedGCS{respond: notFound}
+	b := newCheckedBucket(t, transport, dir)
+	b.remote.marker = remoteDisabledMarker(dir, remoteIdentity("gs://reachable", ""))
+	if _, _, err := b.OutputIDFromAction(context.Background(), someAction); err != nil {
+		t.Error(err)
+	}
+	if !b.remote.allow() {
+		t.Error("bucket turned off by another bucket's marker")
+	}
+	if got := transport.probes.Load(); got != 1 {
+		t.Errorf("probes = %d, want 1", got)
+	}
+}
+
+func TestRemoteIdentity(t *testing.T) {
+	// what the tests change, so the host's values don't matter
+	for _, name := range []string{"GOOGLE_APPLICATION_CREDENTIALS", "GCE_METADATA_HOST", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL", "HTTPS_PROXY", "https_proxy", "CI_JOB_ID"} {
+		t.Setenv(name, "")
+	}
+	base := remoteIdentity("gs://bucket", "p/1/")
+
+	tests := map[string]struct {
+		url, prefix string
+		env         map[string]string
+		same        bool
+	}{
+		"same":                   {"gs://bucket", "p/1/", nil, true},
+		"other bucket":           {"gs://other", "p/1/", nil, false},
+		"other parameters":       {"gs://bucket?anonymous=true", "p/1/", nil, false},
+		"other prefix":           {"gs://bucket", "p/2/", nil, false},
+		"credentials file":       {"gs://bucket", "p/1/", map[string]string{"GOOGLE_APPLICATION_CREDENTIALS": "/creds.json"}, false},
+		"metadata server":        {"gs://bucket", "p/1/", map[string]string{"GCE_METADATA_HOST": "10.0.0.1"}, false},
+		"endpoint":               {"gs://bucket", "p/1/", map[string]string{"AWS_ENDPOINT_URL": "http://minio:9000"}, false},
+		"proxy":                  {"gs://bucket", "p/1/", map[string]string{"HTTPS_PROXY": "http://proxy:3128"}, false},
+		"lowercase proxy":        {"gs://bucket", "p/1/", map[string]string{"https_proxy": "http://proxy:3128"}, false},
+		"a secret":               {"gs://bucket", "p/1/", map[string]string{"AWS_SECRET_ACCESS_KEY": "one"}, false},
+		"unrelated variable":     {"gs://bucket", "p/1/", map[string]string{"CI_JOB_ID": "1"}, true},
+		"empty credentials file": {"gs://bucket", "p/1/", map[string]string{"GOOGLE_APPLICATION_CREDENTIALS": ""}, true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			if got := remoteIdentity(tc.url, tc.prefix) == base; got != tc.same {
+				t.Errorf("same identity = %v, want %v", got, tc.same)
+			}
+		})
+	}
+
+	// only whether a secret or a proxy's credentials are set counts, and
+	// they aren't written into the marker's name
+	identity := func(env map[string]string) string {
+		for k, v := range env {
+			t.Setenv(k, v)
+		}
+		return remoteIdentity("gs://bucket", "p/1/")
+	}
+	one := identity(map[string]string{"AWS_SECRET_ACCESS_KEY": "secret-7f2c", "HTTPS_PROXY": "http://user:password-7f2c@proxy:3128"})
+	two := identity(map[string]string{"AWS_SECRET_ACCESS_KEY": "secret-91ab", "HTTPS_PROXY": "http://user:password-91ab@proxy:3128"})
+	if one != two {
+		t.Errorf("identities differ by secrets: %q, %q", one, two)
+	}
+	if strings.Contains(one, "7f2c") {
+		t.Errorf("identity holds a secret: %q", one)
+	}
+}
+
 func TestStartup_ExpiredMarkerIsIgnored(t *testing.T) {
 	dir := t.TempDir()
-	marker := filepath.Join(dir, remoteDisabledFile)
+	marker := remoteDisabledMarker(dir, testRemote)
 	if err := os.WriteFile(marker, []byte("old\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

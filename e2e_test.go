@@ -139,6 +139,46 @@ func TestEndToEnd_UnreachableBucket(t *testing.T) {
 	}
 }
 
+// TestEndToEnd_UnreachableBucketKeepsOthers checks that a bucket found
+// unreachable isn't turned off for go commands sharing the local cache that
+// use another bucket, as on a developer machine or a shell executor where
+// every project uses the default -dir.
+func TestEndToEnd_UnreachableBucketKeepsOthers(t *testing.T) {
+	tmp := t.TempDir()
+	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
+
+	mod := filepath.Join(tmp, "mod")
+	writeModule(t, mod, map[string]string{
+		"go.mod":          "module example.com/others\n\ngo 1.24\n",
+		"lib/lib.go":      "package lib\n\nfunc Add(a, b int) int { return a + b }\n",
+		"lib/lib_test.go": "package lib\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n",
+	})
+	goCmd := func(env []string, args ...string) map[string]int64 {
+		t.Helper()
+		cmd := exec.Command(goBin, args...)
+		cmd.Dir = mod
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("go %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return parseStats(t, string(out))
+	}
+
+	goCmd(jobEnv(tmp, "writer", bin, bucketURL, "-stats"), "test", "./...")
+
+	// the GCS client retries a refused connection until its context ends
+	down := append(jobEnv(tmp, "shared", bin, "gs://bucket", "-stats"), "STORAGE_EMULATOR_HOST=127.0.0.1:1")
+	if stats := goCmd(down, "build", "./..."); stats["remote_disabled"] == 0 {
+		t.Fatalf("unreachable bucket not disabled: %v", stats)
+	}
+
+	stats := goCmd(jobEnv(tmp, "shared", bin, bucketURL, "-stats"), "test", "./...")
+	if stats["remote_disabled"] != 0 || stats["downloads"] == 0 {
+		t.Errorf("reachable bucket not used after another was found unreachable: %v", stats)
+	}
+}
+
 // TestEndToEnd_CleanTestcache checks that "go clean -testcache" expires test
 // results from the bucket, which the go command does by the time they were
 // put, and that the results of rerunning them are stored for later jobs.

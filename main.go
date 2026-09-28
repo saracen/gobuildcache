@@ -187,6 +187,10 @@ type options struct {
 	dedupeWait   time.Duration
 	testExpire   time.Time
 	expireOthers bool
+
+	// remote identifies the bucket, keying its remote-disabled marker; see
+	// remoteIdentity.
+	remote string
 }
 
 func defaultCacheDir() (string, error) {
@@ -230,6 +234,7 @@ func run(ctx context.Context, prefix, bucketURL string, opts options) error {
 	// such as a startup check it gave up on (see Bucket.probe), which the go
 	// command would then wait for too.
 	bucket = blob.PrefixedBucket(bucket, prefix)
+	opts.remote = remoteIdentity(bucketURL, prefix)
 
 	return serve(ctx, bucket, opts, os.Stdin, originalStdout)
 }
@@ -240,7 +245,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		expireOthers: opts.expireOthers,
 	}
 	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly, refreshAfter: opts.refreshAfter, testExpire: opts.testExpire}
-	cacher.bucket.remote.marker = filepath.Join(cacher.disk.cacheDir, remoteDisabledFile)
+	cacher.bucket.remote.marker = remoteDisabledMarker(cacher.disk.cacheDir, opts.remote)
 	cacher.bucket.stats.Started = time.Now()
 	cacher.bucket.Start(ctx)
 

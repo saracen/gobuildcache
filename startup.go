@@ -3,18 +3,24 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"gocloud.dev/gcerrors"
 )
 
 const (
-	// remoteDisabledFile, in the local cache directory, is the breaker's
-	// marker: see breaker.marker.
+	// remoteDisabledFile, in the local cache directory, names the breaker's
+	// markers: see breaker.marker and remoteDisabledMarker.
 	remoteDisabledFile = "remote-disabled"
 
 	// remoteDisabledTTL is how long a process that found the bucket
@@ -147,6 +153,71 @@ func unreachable(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// remoteDisabledMarker returns the path of the marker in dir for the bucket
+// that remote identifies (see remoteIdentity).
+func remoteDisabledMarker(dir, remote string) string {
+	sum := sha256.Sum256([]byte(remote))
+	return filepath.Join(dir, remoteDisabledFile+"-"+hex.EncodeToString(sum[:8]))
+}
+
+// remoteIdentity identifies the bucket at bucketURL under prefix, and how this
+// process reaches it, to key its remote-disabled marker. Processes sharing a
+// local cache can use different buckets, or the same bucket through different
+// endpoints, proxies or sources of credentials, and one of them being
+// unreachable says nothing about the others. For example, a go command
+// started without the credentials file that -env maps in asks the metadata
+// server for a token, which off GCE never answers.
+//
+// So it's the URL, including parameters such as endpoint and anonymous, the
+// prefix, and the environment variables that the providers' clients and Go's
+// proxy settings read to decide where requests go and where credentials come
+// from, as -env left them. Other variables, such as those the go command sets
+// for each invocation, don't count, so a job's go commands still share it.
+func remoteIdentity(bucketURL, prefix string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%q %q", bucketURL, prefix)
+
+	env := os.Environ()
+	sort.Strings(env)
+	for _, kv := range env {
+		name, value, _ := strings.Cut(kv, "=")
+		if value = reachEnv(name, value); value != "" {
+			fmt.Fprintf(&b, " %q=%q", name, value)
+		}
+	}
+	return b.String()
+}
+
+// reachEnv returns what counts towards remoteIdentity of the environment
+// variable name set to value, or "" for none. The clients treat an empty
+// variable as unset. What a secret is doesn't change what's reached, only
+// whether one is set, and a proxy's credentials don't change where requests
+// go, so neither goes into the marker's name.
+func reachEnv(name, value string) string {
+	upper := strings.ToUpper(name)
+	switch {
+	case value == "":
+		return ""
+	case upper == "HTTP_PROXY" || upper == "HTTPS_PROXY":
+		if u, err := url.Parse(value); err == nil && u.User != nil {
+			u.User = nil
+			return u.String()
+		}
+		return value
+	case upper == "NO_PROXY" || upper == "STORAGE_EMULATOR_HOST":
+		return value
+	case !strings.HasPrefix(upper, "GOOGLE_") && !strings.HasPrefix(upper, "GCE_") &&
+		!strings.HasPrefix(upper, "AWS_") && !strings.HasPrefix(upper, "AZURE_"):
+		return ""
+	}
+	for _, secret := range []string{"SECRET", "TOKEN", "KEY", "PASSWORD", "CONNECTION_STRING", "SAS"} {
+		if strings.Contains(upper, secret) {
+			return "set"
+		}
+	}
+	return value
 }
 
 // readRemoteDisabled returns when the marker was written and why, if it was
