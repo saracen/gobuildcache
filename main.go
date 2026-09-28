@@ -70,6 +70,10 @@ type Cacher struct {
 	bucket *Bucket
 	flight singleflight.Group
 
+	// delta keeps this process's puts apart from -dir, and is looked in
+	// first; nil to keep puts in -dir. See delta.go.
+	delta *delta
+
 	// claims coordinates misses with other processes sharing the local
 	// cache directory; nil to not.
 	claims *claims
@@ -108,8 +112,15 @@ func (c *Cacher) Get(ctx context.Context, req *request) (string, time.Time, erro
 }
 
 // localHit returns the path of actionID's output and when it was put if it's
-// in the local cache.
+// in the delta or the local cache.
 func (c *Cacher) localHit(actionID string) (string, time.Time) {
+	if c.delta != nil {
+		if pathname, putTime := c.delta.hit(actionID); pathname != "" {
+			c.bucket.stats.DeltaHits.Add(1)
+			return pathname, putTime
+		}
+	}
+
 	outputID, putTime, err := c.disk.OutputIDFromAction(context.Background(), actionID)
 	if err != nil || outputID == "" {
 		return "", time.Time{}
@@ -124,6 +135,13 @@ func (c *Cacher) localHit(actionID string) (string, time.Time) {
 
 func (c *Cacher) get(ctx context.Context, actionID string) (string, time.Time, error) {
 	slog.Debug("get", "action", actionID)
+
+	if c.delta != nil {
+		if pathname, putTime := c.delta.hit(actionID); pathname != "" {
+			c.bucket.stats.DeltaHits.Add(1)
+			return pathname, putTime, nil
+		}
+	}
 
 	outputID, putTime, err := c.bucket.OutputIDFromAction(ctx, actionID)
 	if err != nil {
@@ -151,6 +169,17 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 	outputID := hex.EncodeToString(req.OutputID)
 
 	slog.Debug("put", "action", actionID, "output", outputID)
+
+	if c.delta != nil {
+		pathname, err := c.putDelta(ctx, actionID, outputID, req.Body)
+		if err == nil {
+			c.puts.Store(actionID, outputID)
+		}
+		if c.claims != nil {
+			c.claims.release(actionID)
+		}
+		return pathname, err
+	}
 
 	pathname, err, shared := c.flight.Do("put"+outputID, func() (any, error) {
 		pathname, _, err := c.bucket.PutOutput(ctx, outputID, req.Body)
@@ -188,9 +217,25 @@ type options struct {
 	testExpire   time.Time
 	expireOthers bool
 
+	// deltaDir, if set, is where this process keeps its puts; see delta.go.
+	deltaDir string
+
 	// remote identifies the bucket, keying its remote-disabled marker; see
 	// remoteIdentity.
 	remote string
+}
+
+// validate reports options that can't be used together.
+func (o options) validate() error {
+	// A writer's puts belong in the bucket, where every later job finds
+	// them. Kept in a delta instead, they'd never be uploaded.
+	if o.deltaDir != "" && !o.readonly {
+		return errors.New("-delta-dir requires -readonly")
+	}
+	if o.deltaDir != "" && filepath.Clean(o.deltaDir) == filepath.Clean(o.cacheDir) {
+		return errors.New("-delta-dir must not be -dir")
+	}
+	return nil
 }
 
 func defaultCacheDir() (string, error) {
@@ -240,6 +285,10 @@ func run(ctx context.Context, prefix, bucketURL string, opts options) error {
 }
 
 func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader, out io.Writer) error {
+	if err := opts.validate(); err != nil {
+		return err
+	}
+
 	cacher := &Cacher{
 		disk:         &Disk{cacheDir: opts.cacheDir},
 		expireOthers: opts.expireOthers,
@@ -272,6 +321,14 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		return fmt.Errorf("creating cache output dir: %w", err)
 	}
 
+	if opts.deltaDir != "" {
+		delta, err := newDelta(opts.deltaDir)
+		if err != nil {
+			return err
+		}
+		cacher.delta = delta
+	}
+
 	if opts.dedupeWait > 0 {
 		claims, err := newClaims(cacher.disk.cacheDir, opts.dedupeWait, &cacher.bucket.stats)
 		if err != nil {
@@ -280,10 +337,10 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		cacher.claims = claims
 	}
 
-	// Puts are accepted even when readonly, and only kept locally: the go
-	// command reads back some of what it puts within the same invocation,
-	// such as the generated test main of a test package, and fails if the
-	// cache doesn't have it.
+	// Puts are accepted even when readonly, and only kept locally, in -dir or
+	// the delta: the go command reads back some of what it puts within the
+	// same invocation, such as the generated test main of a test package,
+	// and fails if the cache doesn't have it.
 	caps := []cmd{cmdClose, cmdGet, cmdPut}
 
 	r, w := bufio.NewReader(in), bufio.NewWriter(out)
@@ -424,6 +481,10 @@ func init() {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "prune" {
+		os.Exit(pruneMain(os.Args[2:]))
+	}
+
 	var prefix string
 	var verbose bool
 	var opts options
@@ -437,9 +498,10 @@ func main() {
 	flag.DurationVar(&opts.refreshAfter, "refresh-after", 24*time.Hour, "rewrite objects older than this when using them, to restart their expiry (0 disables)")
 	flag.BoolVar(&opts.expireOthers, "expire-others", false, "report entries this process didn't put as put at the Unix epoch, so that after \"go clean -testcache\" the go command reruns every test result it didn't produce itself")
 	flag.StringVar(&opts.cacheDir, "dir", "", "local cache directory (default: <user cache dir>/.gocachebucket)")
+	flag.StringVar(&opts.deltaDir, "delta-dir", "", "keep this process's puts in this directory rather than -dir, and look there first; requires -readonly")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "%s <bucket url>\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "%s [flags] <bucket url>\n%s prune [flags]\n", os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -471,6 +533,22 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if err := opts.validate(); err != nil {
+		slog.Error("run error", "err", err)
+		os.Exit(2)
+	}
+
+	// The go command needs absolute paths to outputs, and a delta dir is
+	// naturally given relative to a CI job's project directory, which is
+	// where CI caches can save it from.
+	if opts.deltaDir != "" {
+		var err error
+		opts.deltaDir, err = filepath.Abs(opts.deltaDir)
+		if err != nil {
+			slog.Error("run error", "err", err)
+			os.Exit(1)
+		}
+	}
 
 	opts.testExpire = readTestExpire()
 
@@ -478,4 +556,54 @@ func main() {
 		slog.Error("run error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// pruneMain runs "gobuildcache prune", which prunes a delta dir; see
+// pruneDelta.
+func pruneMain(args []string) int {
+	flags := flag.NewFlagSet("prune", flag.ContinueOnError)
+	deltaDir := flags.String("delta-dir", "", "the delta directory to prune")
+	usedSince := flags.String("used-since", "", "remove entries not used since this time, in Unix seconds or RFC 3339, such as when the job started")
+	maxSize := flags.String("max-size", "", "remove the least recently used entries, after -used-since, until their outputs take at most this size, in bytes or with a KiB, MiB or GiB suffix")
+	verbose := flags.Bool("v", false, "verbose")
+	flags.Usage = func() {
+		fmt.Fprintf(flags.Output(), "%s prune -delta-dir <dir> [-used-since <time>] [-max-size <size>]\n", os.Args[0])
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+
+	var opts pruneOptions
+	var err error
+	if *usedSince != "" {
+		if opts.usedSince, err = parseTime(*usedSince); err != nil {
+			slog.Error("prune", "err", err)
+			return 2
+		}
+	}
+	if *maxSize != "" {
+		if opts.maxSize, err = parseSize(*maxSize); err != nil {
+			slog.Error("prune", "err", err)
+			return 2
+		}
+	}
+	if *deltaDir == "" || flags.NArg() != 0 || (opts.usedSince.IsZero() && opts.maxSize == 0) {
+		flags.Usage()
+		return 2
+	}
+
+	result, err := pruneDelta(*deltaDir, opts)
+	if err != nil {
+		slog.Error("prune", "err", err)
+		return 1
+	}
+	slog.Info("gobuildcache prune", "kept", result.Kept, "kept_bytes", result.KeptBytes, "removed", result.Removed, "removed_bytes", result.RemovedBytes)
+	return 0
 }

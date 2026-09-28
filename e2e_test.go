@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -511,5 +513,302 @@ func writeFiles(t *testing.T, root string, files map[string]string) {
 		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestEndToEnd_Delta follows a merge request's pipelines, which read the
+// bucket that trusted writers fill and keep what they compute in a delta.
+// The first job puts only what its change needs, the next job gets those
+// from the delta and everything else from the bucket, and pruning keeps only
+// what that job used. Nothing from a delta reaches the bucket.
+func TestEndToEnd_Delta(t *testing.T) {
+	tmp := t.TempDir()
+	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
+	bucketDir := filepath.Join(tmp, "bucket")
+
+	test := func(pkg, call string) string {
+		return "package " + pkg + "\n\nimport \"testing\"\n\nfunc TestIt(t *testing.T) { t.Log(" + call + ") }\n"
+	}
+	mod := filepath.Join(tmp, "mod")
+	base := map[string]string{
+		"go.mod":          "module example.com/delta\n\ngo 1.24\n",
+		"lib/lib.go":      "package lib\n\nfunc Add(a, b int) int { return a + b }\n",
+		"lib/lib_test.go": test("lib", "Add(1, 2)"),
+		"app/app.go":      "package app\n\nimport \"example.com/delta/lib\"\n\nfunc Three() int { return lib.Add(1, 2) }\n",
+		"app/app_test.go": test("app", "Three()"),
+		"other/other.go":  "package other\n\nfunc One() int { return 1 }\n",
+		"other/o_test.go": test("other", "One()"),
+		"extra/extra.go":  "package extra\n\nfunc Two() int { return 2 }\n",
+		"extra/e_test.go": test("extra", "Two()"),
+	}
+	// The merge request's first commit changes lib, which app imports, and
+	// extra. Its second reverts extra.
+	lib := map[string]string{
+		"lib/lib.go":      "package lib\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Sub(a, b int) int { return a - b }\n",
+		"lib/lib_test.go": test("lib", "Sub(Add(1, 2), 3)"),
+	}
+	extra := map[string]string{
+		"extra/extra.go":  "package extra\n\nfunc Two() int { return 2 }\n\nfunc Four() int { return 4 }\n",
+		"extra/e_test.go": test("extra", "Four()"),
+	}
+	commit := func(changes ...map[string]string) {
+		t.Helper()
+		writeModule(t, mod, base)
+		for _, c := range changes {
+			writeModule(t, mod, c)
+		}
+	}
+
+	goTest := func(name string, flags ...string) (string, map[string]int64) {
+		t.Helper()
+
+		cmd := exec.Command(goBin, "test", "./...")
+		cmd.Dir = mod
+		cmd.Env = jobEnv(tmp, name, bin, bucketURL, append([]string{"-stats"}, flags...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: go test: %v\n%s", name, err, out)
+		}
+		return string(out), parseStats(t, string(out))
+	}
+	mrJob := func(name, delta string) (string, map[string]int64) {
+		t.Helper()
+		return goTest(name, "-readonly", "-delta-dir", delta)
+	}
+	cached := func(out, pkg string) bool {
+		return regexp.MustCompile(`(?m)^ok\s+example\.com/delta/` + pkg + `\s.*\(cached\)`).MatchString(out)
+	}
+
+	commit()
+	if _, writer := goTest("writer"); writer["uploads"] == 0 || writer["upload_errors"] != 0 {
+		t.Fatalf("writer didn't fill the bucket: %v", writer)
+	}
+	bucket := snapshotTree(t, bucketDir)
+	_, bucketBytes := deltaEntries(t, bucketDir)
+
+	// The first job computes lib, app and extra, and puts only those in its
+	// delta: exactly what a readonly job without one keeps in -dir that the
+	// bucket doesn't have.
+	commit(lib, extra)
+	delta1 := filepath.Join(tmp, "delta1")
+	out, job1 := mrJob("mr1", delta1)
+	if !cached(out, "other") || !cached(out, "app") || cached(out, "lib") || cached(out, "extra") {
+		t.Errorf("first job: want other's and app's test results cached, app's binary being the same:\n%s", out)
+	}
+	entries1, bytes1 := deltaEntries(t, delta1)
+	t.Logf("first job's delta: %d entries, %d bytes; bucket: %d bytes", len(entries1), bytes1, bucketBytes)
+	if len(entries1) == 0 || int64(len(entries1)) != job1["delta_puts"] || bytes1 != job1["delta_put_bytes"] {
+		t.Errorf("first job's delta has %d entries, %d bytes, want its %d puts, %d bytes: %v", len(entries1), bytes1, job1["delta_puts"], job1["delta_put_bytes"], job1)
+	}
+	if bytes1 == 0 || bytes1*20 > bucketBytes {
+		t.Errorf("first job's delta takes %d bytes, want a little of the bucket's %d", bytes1, bucketBytes)
+	}
+	if job1["downloads"] == 0 || job1["uploads"] != 0 {
+		t.Errorf("first job: %v", job1)
+	}
+	for actionID := range entries1 {
+		if _, err := os.Stat(filepath.Join(bucketDir, actionDir, actionID)); err == nil {
+			t.Errorf("first job put %s in its delta, which the bucket has", actionID)
+		}
+	}
+	if local := localPuts(t, filepath.Join(tmp, "mr1"), bucketDir); len(local) != 0 {
+		t.Errorf("first job put %d entries in -dir, not the delta", len(local))
+	}
+	_, control := goTest("mr1-control", "-readonly")
+	if want := localPuts(t, filepath.Join(tmp, "mr1-control"), bucketDir); !sameKeys(entries1, want) {
+		t.Errorf("first job's delta has %d entries, want the %d that a readonly job without one puts in -dir (%v)", len(entries1), len(want), control)
+	}
+
+	// The next pipeline restores the delta. Its lib and app entries hit the
+	// delta, and the reverted extra and everything else hit the bucket, so
+	// it puts nothing.
+	commit(lib)
+	delta2 := filepath.Join(tmp, "delta2")
+	copyTree(t, delta1, delta2)
+	started := time.Now()
+	out, job2 := mrJob("mr2", delta2)
+	for _, pkg := range []string{"lib", "app", "other", "extra"} {
+		if !cached(out, pkg) {
+			t.Errorf("second job: %s's test result wasn't cached:\n%s", pkg, out)
+		}
+	}
+	if job2["delta_hits"] == 0 || job2["downloads"] == 0 || job2["delta_puts"] != 0 || job2["uploads"] != 0 {
+		t.Errorf("second job: want hits from both the delta and the bucket, and no puts: %v", job2)
+	}
+	if entries, size := deltaEntries(t, delta2); !sameKeys(entries, entries1) || size != bytes1 {
+		t.Errorf("second job changed the delta: %d entries, %d bytes, from %d, %d", len(entries), size, len(entries1), bytes1)
+	}
+
+	// Pruning removes the entries the second job didn't use: extra's, and
+	// some of lib's, since the go command stores a test result it ran under
+	// two keys, and later jobs only look up the first.
+	prune := exec.Command(bin, "prune", "-delta-dir", delta2, "-used-since", started.Format(time.RFC3339Nano))
+	if out, err := prune.CombinedOutput(); err != nil {
+		t.Fatalf("prune: %v\n%s", err, out)
+	}
+	entries2, bytes2 := deltaEntries(t, delta2)
+	pruned := map[string]bool{}
+	for actionID := range entries1 {
+		if _, ok := entries2[actionID]; !ok {
+			pruned[actionID] = true
+		}
+	}
+	t.Logf("pruned delta: %d entries, %d bytes", len(entries2), bytes2)
+	if len(entries2) == 0 || len(pruned) == 0 || len(entries2)+len(pruned) != len(entries1) || bytes2 >= bytes1 {
+		t.Errorf("pruning kept %d of %d entries, %d of %d bytes", len(entries2), len(entries1), bytes2, bytes1)
+	}
+	for actionID := range entries2 {
+		if used := readUsed(delta2, actionID); used.Before(started) {
+			t.Errorf("pruning kept %s, last used at %v, before the second job started at %v", actionID, used, started)
+		}
+	}
+
+	// It kept everything the second job used...
+	delta3 := filepath.Join(tmp, "delta3")
+	copyTree(t, delta2, delta3)
+	if _, job3 := mrJob("mr3", delta3); job3["delta_puts"] != 0 || job3["delta_hits"] != job2["delta_hits"] {
+		t.Errorf("job after pruning: want the second job's %d delta hits, and no puts: %v", job2["delta_hits"], job3)
+	}
+
+	// ...and extra's entries are among those it removed: changing extra
+	// again only puts entries it removed.
+	commit(lib, extra)
+	delta4 := filepath.Join(tmp, "delta4")
+	copyTree(t, delta2, delta4)
+	_, job4 := mrJob("mr4", delta4)
+	entries4, _ := deltaEntries(t, delta4)
+	if job4["delta_puts"] == 0 || int64(len(entries4)) != int64(len(entries2))+job4["delta_puts"] {
+		t.Errorf("changing extra again put %d entries in a delta of %d, now %d: %v", job4["delta_puts"], len(entries2), len(entries4), job4)
+	}
+	for actionID := range entries4 {
+		if _, kept := entries2[actionID]; !kept && !pruned[actionID] {
+			t.Errorf("changing extra again put %s, which pruning didn't remove", actionID)
+		}
+	}
+
+	if got := snapshotTree(t, bucketDir); !reflect.DeepEqual(got, bucket) {
+		t.Errorf("merge request jobs changed the bucket")
+	}
+}
+
+// deltaEntries returns the action links in dir, a delta, local cache or
+// file:// bucket, and the size of its outputs.
+func deltaEntries(t *testing.T, dir string) (map[string]struct{}, int64) {
+	t.Helper()
+
+	entries := map[string]struct{}{}
+	names, err := os.ReadDir(filepath.Join(dir, actionDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range names {
+		if isValidID(e.Name()) {
+			entries[e.Name()] = struct{}{}
+		}
+	}
+
+	var size int64
+	outputs, err := os.ReadDir(filepath.Join(dir, outputDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range outputs {
+		if !isValidID(e.Name()) {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		size += fi.Size()
+	}
+	return entries, size
+}
+
+// localPuts returns the action links in the local cache dir that aren't in
+// the bucket, which the job must have put.
+func localPuts(t *testing.T, dir, bucketDir string) map[string]struct{} {
+	t.Helper()
+
+	entries, _ := deltaEntries(t, dir)
+	for actionID := range entries {
+		if _, err := os.Stat(filepath.Join(bucketDir, actionDir, actionID)); err == nil {
+			delete(entries, actionID)
+		}
+	}
+	return entries
+}
+
+func sameKeys(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// snapshotTree returns every file under root with its size, modification
+// time and contents' hash.
+func snapshotTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+
+	files := map[string]string{}
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		files[p] = fmt.Sprintf("%d %d %s", fi.Size(), fi.ModTime().UnixNano(), hashID(data))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+// copyTree copies src to dst keeping modification times, as restoring a CI
+// cache does.
+func copyTree(t *testing.T, src, dst string) {
+	t.Helper()
+
+	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, data, 0o644); err != nil {
+			return err
+		}
+		return os.Chtimes(target, fi.ModTime(), fi.ModTime())
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

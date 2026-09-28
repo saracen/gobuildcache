@@ -61,6 +61,12 @@ type Stats struct {
 	ClaimHits       atomic.Int64
 	ClaimTimeouts   atomic.Int64
 
+	// DeltaHits counts gets answered from the delta dir, DeltaPuts the puts
+	// stored there, and DeltaPutBytes the size of the outputs they added.
+	DeltaHits     atomic.Int64
+	DeltaPuts     atomic.Int64
+	DeltaPutBytes atomic.Int64
+
 	// Started is when the process started, for its running time.
 	Started time.Time
 }
@@ -100,6 +106,9 @@ func (s *Stats) Log() {
 		"claim_wait_ms", s.ClaimWaitMillis.Load(),
 		"claim_hits", s.ClaimHits.Load(),
 		"claim_timeouts", s.ClaimTimeouts.Load(),
+		"delta_hits", s.DeltaHits.Load(),
+		"delta_puts", s.DeltaPuts.Load(),
+		"delta_put_bytes", s.DeltaPutBytes.Load(),
 	)
 }
 
