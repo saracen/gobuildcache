@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -169,6 +170,7 @@ type options struct {
 	stats        bool
 	refreshAfter time.Duration
 	dedupeWait   time.Duration
+	testExpire   time.Time
 }
 
 func defaultCacheDir() (string, error) {
@@ -178,6 +180,28 @@ func defaultCacheDir() (string, error) {
 	}
 
 	return filepath.Join(cacheDir, ".gocachebucket"), nil
+}
+
+// readTestExpire returns when the go command last expired test results, or
+// the zero time if it hasn't. "go clean -testcache" writes it to
+// testexpire.txt in GOCACHE, which the go command always sets for
+// GOCACHEPROG, to the default if it wasn't set already.
+func readTestExpire() time.Time {
+	dir := os.Getenv("GOCACHE")
+	if !filepath.IsAbs(dir) {
+		return time.Time{}
+	}
+
+	// parsed as the go command does, which ignores a malformed file
+	data, err := os.ReadFile(filepath.Join(dir, "testexpire.txt"))
+	if err != nil || len(data) == 0 || data[len(data)-1] != '\n' {
+		return time.Time{}
+	}
+	ns, err := strconv.ParseInt(string(data[:len(data)-1]), 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 func run(ctx context.Context, prefix, bucketURL string, opts options) error {
@@ -195,7 +219,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 	cacher := &Cacher{
 		disk: &Disk{cacheDir: opts.cacheDir},
 	}
-	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly, refreshAfter: opts.refreshAfter}
+	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly, refreshAfter: opts.refreshAfter, testExpire: opts.testExpire}
 	cacher.bucket.stats.Started = time.Now()
 	cacher.bucket.Start(ctx)
 
@@ -417,6 +441,8 @@ func main() {
 			os.Exit(1)
 		}
 	}
+
+	opts.testExpire = readTestExpire()
 
 	if err := run(context.Background(), prefix, flag.Arg(0), opts); err != nil {
 		slog.Error("run error", "err", err)

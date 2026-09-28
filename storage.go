@@ -96,6 +96,10 @@ type Bucket struct {
 	// readonly keeps puts local, never uploading them.
 	readonly bool
 
+	// testExpire is when the go command last expired test results, or zero
+	// if it hasn't; see readTestExpire.
+	testExpire time.Time
+
 	// refreshAfter is how old an object must be before a writer that uses it
 	// refreshes it; zero disables refreshing. See refresh.go.
 	refreshAfter time.Duration
@@ -220,20 +224,23 @@ func readActionLink(pathname string) (string, time.Time, error) {
 }
 
 // LinkActionToOutput links actionID to outputID, recording that the entry was
-// put at putTime. It reports whether actionID was already linked to outputID,
-// but writes the link regardless: the same entry put again, such as a test
-// rerun after "go clean -testcache", has a new put time.
-func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string, putTime time.Time) (bool, error) {
+// put at putTime. If actionID was already linked to outputID, it returns when
+// that was put, and otherwise the zero time, but it writes the link
+// regardless: the same entry put again, such as a test rerun after "go clean
+// -testcache", has a new put time.
+func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string, putTime time.Time) (time.Time, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
 
-	existing, _, err := readActionLink(actionPathname)
-	exists := err == nil && existing == outputID
+	var previous time.Time
+	if existing, existingPut, err := readActionLink(actionPathname); err == nil && existing == outputID {
+		previous = existingPut
+	}
 
 	// Write to a temporary file and rename, so readers never see a partial link
 	// or one with the wrong time.
 	f, err := os.CreateTemp(filepath.Join(d.cacheDir, actionDir), actionID+".tmp.*")
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
 	defer os.Remove(f.Name())
 
@@ -245,7 +252,7 @@ func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string
 		err = os.Chtimes(f.Name(), putTime, putTime)
 	}
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
 
 	// A legacy symlink would be replaced by the rename on unix, but not on
@@ -255,9 +262,9 @@ func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string
 	}
 
 	if err := os.Rename(f.Name(), actionPathname); err != nil {
-		return false, err
+		return time.Time{}, err
 	}
-	return exists, nil
+	return previous, nil
 }
 
 // OutputIDFromAction returns the output ID actionID is linked to and when its
@@ -351,14 +358,22 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 
 func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {
 	putTime := time.Now()
-	exists, err := b.disk.LinkActionToOutput(ctx, actionID, outputID, putTime)
+	previous, err := b.disk.LinkActionToOutput(ctx, actionID, outputID, putTime)
+	exists := !previous.IsZero()
 	if err != nil || b.readonly {
 		return exists, err
 	}
 
-	// An entry the go command puts again is uploaded again, even unchanged:
-	// it only puts what it has recomputed, such as a test rerun after "go
-	// clean -testcache", and others need the new put time to not expire it.
+	// The go command puts some entries again unchanged every time it uses
+	// them, such as a test package's generated test main on every "go list
+	// -test", and nothing reads their new put time. So an unchanged entry is
+	// only uploaded again if its put time is one this job's go command
+	// expires, as for a test rerun after "go clean -testcache": others need
+	// the new put time to not expire it too.
+	if exists && !previous.Before(b.testExpire) {
+		return true, nil
+	}
+
 	slog.Debug("scheduling upload", "action", actionID, "output", outputID)
 	if err := b.enqueue(queuedJob{upload: &uploadJob{actionID: actionID, outputID: outputID, putTime: putTime}}); err != nil {
 		return false, err

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"io"
 	"io/fs"
 	"math"
 	"os"
@@ -12,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gocloud.dev/blob"
 )
 
 // TestEndToEnd drives the real go command through gobuildcache: a writer
@@ -166,6 +170,84 @@ func TestEndToEnd_ExpireTestResultsWithConcurrentWriters(t *testing.T) {
 	if got, cached, _ := goTestStamp(t, goBin, mod, env("later")); !cached || got != expired {
 		t.Errorf("later job: cached=%v from run %s, want cached from the rerun %s", cached, got, expired)
 	}
+}
+
+// TestEndToEnd_ListTestUploadsOnlyExpiredRePuts checks that the entries the
+// go command puts again unchanged every time it uses them, such as a test
+// package's generated test main on every "go list -test", aren't uploaded
+// again each time, only once "go clean -testcache" has expired them.
+func TestEndToEnd_ListTestUploadsOnlyExpiredRePuts(t *testing.T) {
+	tmp := t.TempDir()
+	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
+	mod := writeStampModule(t, tmp)
+	env := jobEnv(tmp, "lister", bin, bucketURL)
+
+	goList := func() map[string]string {
+		t.Helper()
+
+		cmd := exec.Command(goBin, "list", "-e", "-test", "./...")
+		cmd.Dir = mod
+		cmd.Env = env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go list -test: %v\n%s", err, out)
+		}
+		return linkPutTimes(t, bucketURL)
+	}
+
+	first := goList()
+	if len(first) == 0 {
+		t.Fatal("go list -test uploaded nothing")
+	}
+	if n := reuploaded(first, goList()); n != 0 {
+		t.Errorf("go list -test on a warm local cache uploaded %d of %d action links again", n, len(first))
+	}
+
+	goCleanTestcache(t, goBin, mod, env)
+	if n := reuploaded(first, goList()); n == 0 {
+		t.Errorf("go list -test after go clean -testcache uploaded none of its %d expired action links again", len(first))
+	}
+}
+
+// reuploaded counts the action links in before with a different put time in
+// after.
+func reuploaded(before, after map[string]string) int {
+	n := 0
+	for key, putTime := range before {
+		if after[key] != putTime {
+			n++
+		}
+	}
+	return n
+}
+
+// linkPutTimes returns the put time of every action link in the bucket.
+func linkPutTimes(t *testing.T, bucketURL string) map[string]string {
+	t.Helper()
+	ctx := context.Background()
+
+	bucket, err := blob.OpenBucket(ctx, bucketURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bucket.Close()
+
+	putTimes := map[string]string{}
+	iter := bucket.List(&blob.ListOptions{Prefix: actionDir + "/"})
+	for {
+		obj, err := iter.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		attrs, err := bucket.Attributes(ctx, obj.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		putTimes[obj.Key] = attrs.Metadata[putTimeKey]
+	}
+	return putTimes
 }
 
 // writeStampModule writes a module whose test's output is different every

@@ -62,6 +62,63 @@ func newCacherOn(t *testing.T, underlying *blob.Bucket) *Cacher {
 	return c
 }
 
+func TestReadTestExpire(t *testing.T) {
+	expire := time.Unix(1700000000, 123)
+
+	for _, tc := range []struct {
+		name    string
+		gocache func(t *testing.T) string
+		want    time.Time
+	}{
+		{
+			name: "written by go clean -testcache",
+			gocache: func(t *testing.T) string {
+				return gocacheWith(t, strconv.FormatInt(expire.UnixNano(), 10)+"\n")
+			},
+			want: expire,
+		},
+		{
+			name:    "never cleaned",
+			gocache: func(t *testing.T) string { return t.TempDir() },
+		},
+		{
+			name: "partly written",
+			gocache: func(t *testing.T) string {
+				return gocacheWith(t, strconv.FormatInt(expire.UnixNano(), 10))
+			},
+		},
+		{
+			name:    "malformed",
+			gocache: func(t *testing.T) string { return gocacheWith(t, "soon\n") },
+		},
+		{
+			name:    "GOCACHE unset",
+			gocache: func(t *testing.T) string { return "" },
+		},
+		{
+			name:    "GOCACHE off",
+			gocache: func(t *testing.T) string { return "off" },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GOCACHE", tc.gocache(t))
+			if got := readTestExpire(); !got.Equal(tc.want) {
+				t.Errorf("readTestExpire() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func gocacheWith(t *testing.T, testexpire string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "testexpire.txt"), []byte(testexpire), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func TestCacher_PutGetRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	c := newCacher(t)

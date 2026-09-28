@@ -150,12 +150,12 @@ func TestDiskLinkActionToOutput(t *testing.T) {
 	actionID := strings.Repeat("a", 64)
 	outputID := strings.Repeat("b", 64)
 
-	exists, err := d.LinkActionToOutput(ctx, actionID, outputID, time.Now())
+	previous, err := d.LinkActionToOutput(ctx, actionID, outputID, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exists {
-		t.Error("expected exists=false on first link")
+	if !previous.IsZero() {
+		t.Errorf("previous put time = %v on first link, want zero", previous)
 	}
 
 	got, _, err := d.OutputIDFromAction(ctx, actionID)
@@ -167,22 +167,22 @@ func TestDiskLinkActionToOutput(t *testing.T) {
 	}
 
 	// Idempotent for unchanged target.
-	exists, err = d.LinkActionToOutput(ctx, actionID, outputID, time.Now())
+	previous, err = d.LinkActionToOutput(ctx, actionID, outputID, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists {
-		t.Error("expected exists=true on idempotent link")
+	if previous.IsZero() {
+		t.Error("expected a previous put time on idempotent link")
 	}
 
 	// Replaces symlink when target changes.
 	newOutput := strings.Repeat("c", 64)
-	exists, err = d.LinkActionToOutput(ctx, actionID, newOutput, time.Now())
+	previous, err = d.LinkActionToOutput(ctx, actionID, newOutput, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exists {
-		t.Error("expected exists=false when target changes")
+	if !previous.IsZero() {
+		t.Errorf("previous put time = %v when target changes, want zero", previous)
 	}
 	got, _, err = d.OutputIDFromAction(ctx, actionID)
 	if err != nil {
@@ -210,12 +210,12 @@ func TestDiskLinkActionToOutput_RecordsPutTime(t *testing.T) {
 
 	// the same entry put again is newer
 	second := first.Add(time.Hour)
-	exists, err := d.LinkActionToOutput(ctx, actionID, outputID, second)
+	previous, err := d.LinkActionToOutput(ctx, actionID, outputID, second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists {
-		t.Error("expected exists=true for an unchanged link")
+	if !previous.Equal(first) {
+		t.Errorf("previous put time = %v, want %v", previous, first)
 	}
 	if _, got, err := d.OutputIDFromAction(ctx, actionID); err != nil || !got.Equal(second) {
 		t.Errorf("put time after re-put = %v, %v; want %v", got, err, second)
@@ -552,63 +552,91 @@ func TestBucketOutputIDFromAction_RestoresPutTime(t *testing.T) {
 	}
 }
 
-func TestBucketLinkActionToOutput_RePutUploadsNewPutTime(t *testing.T) {
-	ctx := context.Background()
-	underlying := memblob.OpenBucket(nil)
-	t.Cleanup(func() { underlying.Close() })
-
-	content := []byte("test result")
-	outputID := hashID(content)
-	actionID := strings.Repeat("a", 64)
-	key := path.Join(actionDir, actionID)
-
+// TestBucketLinkActionToOutput_RePut checks that an entry put again unchanged
+// is only uploaded again when the go command has expired it, as for a test
+// rerun after "go clean -testcache". It puts some entries again every time it
+// uses them, such as generated test mains on every "go list -test", which
+// would otherwise be uploaded every time.
+func TestBucketLinkActionToOutput_RePut(t *testing.T) {
 	old := time.Unix(1700000000, 0)
-	if err := underlying.WriteAll(ctx, path.Join(outputDir, outputID), content, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := underlying.WriteAll(ctx, key, nil, &blob.WriterOptions{
-		Metadata: map[string]string{"output_id": outputID, putTimeKey: strconv.FormatInt(old.UnixNano(), 10)},
-	}); err != nil {
-		t.Fatal(err)
-	}
 
-	// The go command gets the entry, rejects it as an expired test result,
-	// reruns the test and puts the same output again.
-	b := &Bucket{disk: newDisk(t), bucket: underlying}
-	b.Start(ctx)
-	if got, _, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
-		t.Fatalf("OutputIDFromAction = %q, %v", got, err)
-	}
-	if _, err := b.GetOutput(ctx, outputID); err != nil {
-		t.Fatal(err)
-	}
-	exists, err := b.LinkActionToOutput(ctx, actionID, outputID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !exists {
-		t.Error("expected exists=true for an unchanged link")
-	}
-	b.Close()
+	for _, tc := range []struct {
+		name       string
+		testExpire time.Time
+		wantUpload bool
+	}{
+		{name: "never expired"},
+		{name: "expired before the put", testExpire: old.Add(-time.Hour)},
+		{name: "expired after the put", testExpire: old.Add(time.Hour), wantUpload: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			underlying := memblob.OpenBucket(nil)
+			t.Cleanup(func() { underlying.Close() })
 
-	_, local, err := b.disk.OutputIDFromAction(ctx, actionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !local.After(old) {
-		t.Errorf("local put time = %v, want after %v", local, old)
-	}
+			content := []byte("test result")
+			outputID := hashID(content)
+			actionID := strings.Repeat("a", 64)
+			key := path.Join(actionDir, actionID)
 
-	attrs, err := underlying.Attributes(ctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ns, err := strconv.ParseInt(attrs.Metadata[putTimeKey], 10, 64)
-	if err != nil {
-		t.Fatalf("bucket put time: %v", err)
-	}
-	if uploaded := time.Unix(0, ns); !uploaded.After(old) || local.Sub(uploaded).Abs() > time.Second {
-		t.Errorf("bucket put time = %v, want the re-put's, %v", uploaded, local)
+			if err := underlying.WriteAll(ctx, path.Join(outputDir, outputID), content, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := underlying.WriteAll(ctx, key, nil, &blob.WriterOptions{
+				Metadata: map[string]string{"output_id": outputID, putTimeKey: strconv.FormatInt(old.UnixNano(), 10)},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			// The go command gets the entry and puts the same output again,
+			// having rejected it as an expired test result if it expired
+			// after the put.
+			b := &Bucket{disk: newDisk(t), bucket: underlying, testExpire: tc.testExpire}
+			b.Start(ctx)
+			if got, _, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
+				t.Fatalf("OutputIDFromAction = %q, %v", got, err)
+			}
+			if _, err := b.GetOutput(ctx, outputID); err != nil {
+				t.Fatal(err)
+			}
+			exists, err := b.LinkActionToOutput(ctx, actionID, outputID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !exists {
+				t.Error("expected exists=true for an unchanged link")
+			}
+			b.Close()
+
+			// Locally it's always put again, so a later go command in the
+			// same job doesn't expire it again.
+			_, local, err := b.disk.OutputIDFromAction(ctx, actionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !local.After(old) {
+				t.Errorf("local put time = %v, want after %v", local, old)
+			}
+
+			attrs, err := underlying.Attributes(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ns, err := strconv.ParseInt(attrs.Metadata[putTimeKey], 10, 64)
+			if err != nil {
+				t.Fatalf("bucket put time: %v", err)
+			}
+			uploaded := time.Unix(0, ns)
+			if !tc.wantUpload {
+				if !uploaded.Equal(old) {
+					t.Errorf("bucket put time = %v, want it left at %v", uploaded, old)
+				}
+				return
+			}
+			if !uploaded.After(old) || local.Sub(uploaded).Abs() > time.Second {
+				t.Errorf("bucket put time = %v, want the re-put's, %v", uploaded, local)
+			}
+		})
 	}
 }
 
