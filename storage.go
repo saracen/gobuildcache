@@ -104,6 +104,7 @@ type Bucket struct {
 	// refreshes it; zero disables refreshing. See refresh.go.
 	refreshAfter time.Duration
 	refreshed    sync.Map // key -> struct{}
+	writes       sync.Map // key -> *keyWrites
 
 	closeOnce sync.Once
 }
@@ -374,6 +375,9 @@ func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID stri
 		return true, nil
 	}
 
+	// before queueing, so a refresh from before the put no longer writes it
+	b.keyWrites(path.Join(actionDir, actionID)).put.Store(true)
+
 	slog.Debug("scheduling upload", "action", actionID, "output", outputID)
 	if err := b.enqueue(queuedJob{upload: &uploadJob{actionID: actionID, outputID: outputID, putTime: putTime}}); err != nil {
 		return false, err
@@ -414,8 +418,13 @@ func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 		return fmt.Errorf("uploading output %s: %w", job.outputID, u.err)
 	}
 
+	key := path.Join(actionDir, job.actionID)
+	w := b.keyWrites(key)
 	err := b.withRetry(ctx, metadataTimeout, func(ctx context.Context) error {
-		return b.bucket.Upload(ctx, path.Join(actionDir, job.actionID), bytes.NewReader(nil), &blob.WriterOptions{
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		return b.bucket.Upload(ctx, key, bytes.NewReader(nil), &blob.WriterOptions{
 			Metadata: map[string]string{
 				"output_id": job.outputID,
 				putTimeKey:  strconv.FormatInt(job.putTime.UnixNano(), 10),

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -283,5 +284,272 @@ func TestRefresh_FallsBackToUploading(t *testing.T) {
 	}
 	if got := b.stats.RefreshUploads.Load(); got != 1 {
 		t.Errorf("refresh uploads = %d, want 1", got)
+	}
+}
+
+// fakeS3 is an in-memory S3 bucket named "bucket", served over path-style
+// URLs, with just what gobuildcache uses.
+type fakeS3 struct {
+	mu   sync.Mutex
+	objs map[string]fakeObject
+
+	// copyStatus fails copies with this status if it's set, and beforeCopy
+	// is called before a copy that isn't failed.
+	copyStatus int
+	beforeCopy func()
+}
+
+type fakeObject struct {
+	body     []byte
+	metadata map[string]string
+	modTime  time.Time
+}
+
+func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+	switch {
+	case r.Method == http.MethodHead || r.Method == http.MethodGet:
+		f.mu.Lock()
+		o, ok := f.objs[key]
+		f.mu.Unlock()
+		if !ok {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			if r.Method == http.MethodGet {
+				io.WriteString(w, `<Error><Code>NoSuchKey</Code><Message>no such key</Message></Error>`)
+			}
+			return
+		}
+		w.Header().Set("Last-Modified", o.modTime.UTC().Format(http.TimeFormat))
+		w.Header().Set("Content-Length", strconv.Itoa(len(o.body)))
+		w.Header().Set("ETag", `"x"`)
+		for k, v := range o.metadata {
+			w.Header().Set("X-Amz-Meta-"+k, v)
+		}
+		if r.Method == http.MethodGet {
+			w.Write(o.body)
+		}
+
+	case r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "":
+		if f.copyStatus != 0 {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(f.copyStatus)
+			io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>copy failed</Message></Error>`)
+			return
+		}
+		if f.beforeCopy != nil {
+			f.beforeCopy()
+		}
+		src, _ := url.PathUnescape(r.Header.Get("X-Amz-Copy-Source"))
+		src = strings.TrimPrefix(strings.TrimPrefix(src, "/"), "bucket/")
+
+		f.mu.Lock()
+		o, ok := f.objs[src]
+		if ok {
+			o.modTime = time.Now()
+			if r.Header.Get("X-Amz-Metadata-Directive") == "REPLACE" {
+				o.metadata = fakeMetadata(r.Header)
+			}
+			f.objs[key] = o
+		}
+		f.mu.Unlock()
+		if !ok {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `<Error><Code>NoSuchKey</Code><Message>no such key</Message></Error>`)
+			return
+		}
+		io.WriteString(w, `<CopyObjectResult><ETag>"x"</ETag></CopyObjectResult>`)
+
+	case r.Method == http.MethodPut:
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		f.objs[key] = fakeObject{body: body, metadata: fakeMetadata(r.Header), modTime: time.Now()}
+		f.mu.Unlock()
+		w.Header().Set("ETag", `"x"`)
+
+	default:
+		http.Error(w, "unexpected request", http.StatusBadRequest)
+	}
+}
+
+func fakeMetadata(h http.Header) map[string]string {
+	m := map[string]string{}
+	for k, v := range h {
+		if name, ok := strings.CutPrefix(strings.ToLower(k), "x-amz-meta-"); ok {
+			m[name] = v[0]
+		}
+	}
+	return m
+}
+
+func (f *fakeS3) object(key string) fakeObject {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.objs[key]
+}
+
+func openFakeS3(t *testing.T, f *fakeS3) *blob.Bucket {
+	t.Helper()
+
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+
+	client := s3.New(s3.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(srv.URL),
+		UsePathStyle: true,
+		// keeps request bodies plain, rather than with trailing checksums
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "id", SecretAccessKey: "secret"}, nil
+		}),
+	})
+	underlying, err := s3blob.OpenBucket(context.Background(), client, "bucket", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { underlying.Close() })
+	return underlying
+}
+
+// getOldLinkOnFakeS3 seeds an action link put two days ago and gets it,
+// which queues a refresh of it. It returns the Bucket, whose queued jobs are
+// run by the caller.
+func getOldLinkOnFakeS3(t *testing.T, f *fakeS3, actionID string) *Bucket {
+	t.Helper()
+
+	old := time.Now().Add(-48 * time.Hour)
+	content := []byte("ok  \tpkg\t0.010s\n")
+	f.objs = map[string]fakeObject{
+		// recent, so only the link is due a refresh
+		path.Join(outputDir, hashID(content)): {body: content, modTime: time.Now()},
+		path.Join(actionDir, actionID): {
+			metadata: map[string]string{"output_id": hashID(content), putTimeKey: strconv.FormatInt(old.UnixNano(), 10)},
+			modTime:  old,
+		},
+	}
+
+	b := &Bucket{disk: newDisk(t), bucket: openFakeS3(t, f), refreshAfter: time.Hour, testExpire: time.Now()}
+	b.jobs = make(chan queuedJob, 10)
+
+	if got, _, err := b.OutputIDFromAction(context.Background(), actionID); err != nil || got != hashID(content) {
+		t.Fatalf("OutputIDFromAction = %q, %v", got, err)
+	}
+	return b
+}
+
+// putRerun puts a new output for actionID, as the go command does when it
+// reruns a test whose result it expired, returning its ID.
+func putRerun(t *testing.T, b *Bucket, actionID string) string {
+	t.Helper()
+	ctx := context.Background()
+
+	content := []byte("ok  \tpkg\t0.020s\n")
+	if _, _, err := b.PutOutput(ctx, hashID(content), bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.LinkActionToOutput(ctx, actionID, hashID(content)); err != nil {
+		t.Fatal(err)
+	}
+	return hashID(content)
+}
+
+// TestRefresh_AfterRePutKeepsIt checks that a refresh of an action link queued
+// before this process put it again doesn't write back the link the put
+// replaced, whether copying or uploading it again.
+func TestRefresh_AfterRePutKeepsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		copyStatus int
+	}{
+		{name: "copied"},
+		{name: "uploaded", copyStatus: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			actionID := strings.Repeat("a", 64)
+			f := &fakeS3{copyStatus: tc.copyStatus}
+			b := getOldLinkOnFakeS3(t, f, actionID)
+			rerun := putRerun(t, b, actionID)
+			close(b.jobs)
+
+			// the upload first, then the refresh queued before it
+			var refreshes []refreshJob
+			for job := range b.jobs {
+				switch {
+				case job.upload != nil:
+					if err := b.upload(ctx, *job.upload); err != nil {
+						t.Fatal(err)
+					}
+				case job.refresh != nil:
+					refreshes = append(refreshes, *job.refresh)
+				}
+			}
+			if len(refreshes) != 1 {
+				t.Fatalf("refreshes queued = %d, want 1", len(refreshes))
+			}
+			if err := b.refresh(ctx, refreshes[0]); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := f.object(path.Join(actionDir, actionID)).metadata["output_id"]; got != rerun {
+				t.Errorf("bucket link's output = %s, want the rerun's %s", got, rerun)
+			}
+		})
+	}
+}
+
+// TestRefresh_InFlightFinishesBeforeRePut checks that when this process puts
+// an action link while refreshing it, the put's upload waits for the refresh,
+// rather than landing first and being overwritten by it.
+func TestRefresh_InFlightFinishesBeforeRePut(t *testing.T) {
+	ctx := context.Background()
+	actionID := strings.Repeat("a", 64)
+
+	copying := make(chan struct{})
+	release := make(chan struct{})
+	f := &fakeS3{beforeCopy: func() {
+		close(copying)
+		<-release
+	}}
+	b := getOldLinkOnFakeS3(t, f, actionID)
+
+	job := <-b.jobs
+	if job.refresh == nil {
+		t.Fatalf("queued %+v, want a refresh", job)
+	}
+	refreshed := make(chan error, 1)
+	go func() { refreshed <- b.refresh(ctx, *job.refresh) }()
+	select {
+	case <-copying:
+	case <-time.After(10 * time.Second):
+		t.Fatal("refresh didn't copy")
+	}
+
+	rerun := putRerun(t, b, actionID)
+	job = <-b.jobs
+	if job.upload == nil {
+		t.Fatalf("queued %+v, want an upload", job)
+	}
+	uploaded := make(chan error, 1)
+	go func() { uploaded <- b.upload(ctx, *job.upload) }()
+
+	// give the upload time to land, if it doesn't wait for the copy
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	if err := <-refreshed; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-uploaded; err != nil {
+		t.Fatal(err)
+	}
+	if got := f.object(path.Join(actionDir, actionID)).metadata["output_id"]; got != rerun {
+		t.Errorf("bucket link's output = %s, want the rerun's %s", got, rerun)
 	}
 }

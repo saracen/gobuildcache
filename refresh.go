@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -24,6 +26,27 @@ import (
 // A refresh is a copy of the object onto itself, done by the provider without
 // transferring the object. If the copy fails, the object is uploaded again from
 // the local cache instead.
+
+// A refresh writes back what the object held when it was read, so for an
+// action link it must not land after this process has put the link since,
+// such as for a test rerun after "go clean -testcache": it would restore the
+// output and put time the rerun replaced. Once an action link has been put,
+// refreshes of it stop, since the put's upload restarts its expiry anyway, and
+// a refresh already writing it finishes before the upload writes it.
+
+// keyWrites orders this process's writes of one key.
+type keyWrites struct {
+	// mu is held while writing the key.
+	mu sync.Mutex
+
+	// put is set once this process has put the key.
+	put atomic.Bool
+}
+
+func (b *Bucket) keyWrites(key string) *keyWrites {
+	v, _ := b.writes.LoadOrStore(key, &keyWrites{})
+	return v.(*keyWrites)
+}
 
 // refreshJob refreshes one object in the bucket.
 type refreshJob struct {
@@ -76,22 +99,42 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 		return nil
 	}
 
+	// write calls op with the key held, unless this process has put it.
+	w := b.keyWrites(job.key)
+	superseded := false
+	write := func(op func() error) error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		if w.put.Load() {
+			superseded = true
+			return nil
+		}
+		return op()
+	}
+
 	err := b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
-		return b.bucket.Copy(ctx, job.key, job.key, &blob.CopyOptions{
-			BeforeCopy: func(asFunc func(any) bool) error {
-				// S3 refuses to copy an object onto itself unless something
-				// about it changes, so have it replace the metadata, with the
-				// same.
-				var input *s3.CopyObjectInput
-				if asFunc(&input) {
-					input.MetadataDirective = s3types.MetadataDirectiveReplace
-					input.Metadata = job.metadata
-					input.ContentType = aws.String(job.contentType)
-				}
-				return nil
-			},
+		return write(func() error {
+			return b.bucket.Copy(ctx, job.key, job.key, &blob.CopyOptions{
+				BeforeCopy: func(asFunc func(any) bool) error {
+					// S3 refuses to copy an object onto itself unless
+					// something about it changes, so have it replace the
+					// metadata, with the same.
+					var input *s3.CopyObjectInput
+					if asFunc(&input) {
+						input.MetadataDirective = s3types.MetadataDirectiveReplace
+						input.Metadata = job.metadata
+						input.ContentType = aws.String(job.contentType)
+					}
+					return nil
+				},
+			})
 		})
 	})
+	if superseded {
+		slog.Debug("refresh superseded by a put", "key", job.key)
+		return nil
+	}
 	if err == nil {
 		b.remote.record(nil)
 		b.stats.Refreshes.Add(1)
@@ -111,14 +154,20 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 	}
 
 	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		return b.bucket.Upload(ctx, job.key, r, &blob.WriterOptions{
-			Metadata:    job.metadata,
-			ContentType: job.contentType,
+		return write(func() error {
+			if _, err := r.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			return b.bucket.Upload(ctx, job.key, r, &blob.WriterOptions{
+				Metadata:    job.metadata,
+				ContentType: job.contentType,
+			})
 		})
 	})
+	if superseded {
+		slog.Debug("refresh superseded by a put", "key", job.key)
+		return nil
+	}
 	b.remote.record(err)
 	if err != nil {
 		return err
