@@ -95,7 +95,7 @@ func (b *Bucket) refreshNow(ctx context.Context, job refreshJob) {
 }
 
 func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
-	if !b.remote.allow() {
+	if !b.useRemote() {
 		return nil
 	}
 

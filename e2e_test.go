@@ -75,6 +75,70 @@ func TestEndToEnd(t *testing.T) {
 	}
 }
 
+// TestEndToEnd_UnreachableBucket checks that go commands don't wait long on a
+// bucket nothing answers for, and still build and test with the local cache:
+// the first finds out at startup, and the rest of the job's go commands
+// skip the bucket.
+func TestEndToEnd_UnreachableBucket(t *testing.T) {
+	for _, mode := range []string{"read-write", "readonly"} {
+		t.Run(mode, func(t *testing.T) {
+			tmp := t.TempDir()
+			goBin, bin, _ := setupEndToEnd(t, tmp)
+
+			mod := filepath.Join(tmp, "mod")
+			writeModule(t, mod, map[string]string{
+				"go.mod":          "module example.com/down\n\ngo 1.24\n",
+				"lib/lib.go":      "package lib\n\nfunc Add(a, b int) int { return a + b }\n",
+				"lib/lib_test.go": "package lib\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n",
+			})
+
+			flags := []string{"-stats"}
+			if mode == "readonly" {
+				flags = append(flags, "-readonly")
+			}
+			// the GCS client retries a refused connection until its context
+			// ends
+			env := append(jobEnv(tmp, "job", bin, "gs://bucket", flags...), "STORAGE_EMULATOR_HOST=127.0.0.1:1")
+
+			var out strings.Builder
+			start := time.Now()
+			for i := range 10 {
+				args := [][]string{{"build", "./..."}, {"vet", "./..."}, {"test", "./..."}}[i%3]
+				cmd := exec.Command(goBin, args...)
+				cmd.Dir = mod
+				cmd.Env = env
+				cmdStart := time.Now()
+				b, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("go %s: %v\n%s", strings.Join(args, " "), err, b)
+				}
+				t.Logf("go %s took %v", strings.Join(args, " "), time.Since(cmdStart))
+				out.Write(b)
+			}
+			took := time.Since(start)
+
+			// about startupTimeout for the first go command, and compiling
+			if took > 30*time.Second {
+				t.Errorf("10 go commands took %v", took)
+			}
+			stats := parseStats(t, out.String())
+			// go commands that find everything locally never check the bucket
+			if stats["remote_disabled"] == 0 {
+				t.Errorf("remote not disabled: %v", stats)
+			}
+			if stats["remote_calls"] != 1 {
+				t.Errorf("remote calls = %d, want only the first go command's startup check", stats["remote_calls"])
+			}
+			if stats["hits"] == 0 {
+				t.Errorf("no local cache hits: %v", stats)
+			}
+			if !strings.Contains(out.String(), "(cached)") {
+				t.Errorf("no cached test result from the local cache:\n%s", out.String())
+			}
+		})
+	}
+}
+
 // TestEndToEnd_CleanTestcache checks that "go clean -testcache" expires test
 // results from the bucket, which the go command does by the time they were
 // put, and that the results of rerunning them are stored for later jobs.

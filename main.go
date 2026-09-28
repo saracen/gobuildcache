@@ -225,7 +225,10 @@ func run(ctx context.Context, prefix, bucketURL string, opts options) error {
 	if err != nil {
 		return fmt.Errorf("opening bucket: %w", err)
 	}
-	defer bucket.Close()
+	// The bucket isn't closed: serve waits for every upload, the process
+	// exits once it returns, and closing waits for any call still running,
+	// such as a startup check it gave up on (see Bucket.probe), which the go
+	// command would then wait for too.
 	bucket = blob.PrefixedBucket(bucket, prefix)
 
 	return serve(ctx, bucket, opts, os.Stdin, originalStdout)
@@ -237,6 +240,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		expireOthers: opts.expireOthers,
 	}
 	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly, refreshAfter: opts.refreshAfter, testExpire: opts.testExpire}
+	cacher.bucket.remote.marker = filepath.Join(cacher.disk.cacheDir, remoteDisabledFile)
 	cacher.bucket.stats.Started = time.Now()
 	cacher.bucket.Start(ctx)
 
@@ -249,6 +253,9 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		}
 		cacher.bucket.Close()
 		if opts.stats {
+			if !cacher.bucket.remote.allow() {
+				cacher.bucket.stats.RemoteDisabled.Store(1)
+			}
 			cacher.bucket.stats.Log()
 		}
 	}()

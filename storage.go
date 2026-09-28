@@ -94,6 +94,10 @@ type Bucket struct {
 	stats  Stats
 	remote breaker
 
+	// startup checks the bucket before the process first uses it, when the
+	// breaker has a marker; see useRemote.
+	startup sync.Once
+
 	// readonly keeps puts local, never uploading them.
 	readonly bool
 
@@ -297,7 +301,7 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		slog.Debug("empty marker expired", "action", actionID)
 	}
 
-	if !b.remote.allow() {
+	if !b.useRemote() {
 		return "", time.Time{}, nil
 	}
 
@@ -407,7 +411,7 @@ func (b *Bucket) enqueue(job queuedJob) (err error) {
 func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 	v, _ := b.outputs.LoadOrStore(job.outputID, &outputUpload{})
 	u := v.(*outputUpload)
-	if !b.remote.allow() {
+	if !b.useRemote() {
 		b.stats.UploadsSkipped.Add(1)
 		return nil
 	}
@@ -566,7 +570,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return pathname, nil
 	}
 
-	if !b.remote.allow() {
+	if !b.useRemote() {
 		return "", nil
 	}
 

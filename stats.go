@@ -49,6 +49,10 @@ type Stats struct {
 	RemotePeakInFlight  atomic.Int64
 	remoteInFlight      atomic.Int64
 
+	// RemoteDisabled is 1 if the bucket was turned off, by this process's
+	// breaker or because another process sharing the local cache had.
+	RemoteDisabled atomic.Int64
+
 	// ClaimWaits counts misses that waited for another process computing the
 	// same action, ClaimHits those that then got a hit, and ClaimTimeouts
 	// those that gave up waiting.
@@ -91,9 +95,37 @@ func (s *Stats) Log() {
 		"remote_wait_ms", s.RemoteWaitMillis.Load(),
 		"remote_slowest_ms", s.RemoteSlowestMillis.Load(),
 		"remote_peak_in_flight", s.RemotePeakInFlight.Load(),
+		"remote_disabled", s.RemoteDisabled.Load(),
 		"claim_waits", s.ClaimWaits.Load(),
 		"claim_wait_ms", s.ClaimWaitMillis.Load(),
 		"claim_hits", s.ClaimHits.Load(),
 		"claim_timeouts", s.ClaimTimeouts.Load(),
 	)
+}
+
+// remoteCall counts a call to the bucket, returning a function to call when
+// it has finished, retries included.
+func (s *Stats) remoteCall() func() {
+	s.RemoteCalls.Add(1)
+	inFlight := s.remoteInFlight.Add(1)
+	for {
+		peak := s.RemotePeakInFlight.Load()
+		if inFlight <= peak || s.RemotePeakInFlight.CompareAndSwap(peak, inFlight) {
+			break
+		}
+	}
+
+	start := time.Now()
+	return func() {
+		s.remoteInFlight.Add(-1)
+
+		took := time.Since(start).Milliseconds()
+		s.RemoteWaitMillis.Add(took)
+		for {
+			slowest := s.RemoteSlowestMillis.Load()
+			if took <= slowest || s.RemoteSlowestMillis.CompareAndSwap(slowest, took) {
+				break
+			}
+		}
+	}
 }
