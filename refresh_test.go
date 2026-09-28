@@ -393,7 +393,7 @@ func (f *fakeS3) object(key string) fakeObject {
 	return f.objs[key]
 }
 
-func openFakeS3(t *testing.T, f *fakeS3) *blob.Bucket {
+func openFakeS3(t *testing.T, f http.Handler) *blob.Bucket {
 	t.Helper()
 
 	srv := httptest.NewServer(f)

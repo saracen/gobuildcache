@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -279,8 +280,9 @@ func TestStartup_CallsWaitForOneCheck(t *testing.T) {
 }
 
 // Errors that answer, such as an unauthorized anonymous caller, aren't
-// unreachability; they count towards the breaker as later errors do.
-func TestStartup_OtherErrorsCountTowardsTheBreaker(t *testing.T) {
+// unreachability. The check leaves them to the process's own calls, which
+// count towards the breaker as usual.
+func TestStartup_OtherErrorsAreLeftToTheBreaker(t *testing.T) {
 	fastRetries(t, time.Second)
 	transport := &scriptedGCS{respond: func(r *http.Request) (*http.Response, error) {
 		return gcsStatus(r, http.StatusUnauthorized)
@@ -291,10 +293,13 @@ func TestStartup_OtherErrorsCountTowardsTheBreaker(t *testing.T) {
 		t.Error("lookup succeeded")
 	}
 	if !b.remote.allow() {
-		t.Error("bucket turned off after 2 failures")
+		t.Error("bucket turned off after 1 failure")
 	}
-	if got := b.remote.failures.Load(); got != 2 {
-		t.Errorf("failures = %d, want the probe and the lookup", got)
+	if got := b.remote.failures.Load(); got != 1 {
+		t.Errorf("failures = %d, want only the lookup", got)
+	}
+	if got := transport.probes.Load(); got != 1 {
+		t.Errorf("probes = %d, want 1", got)
 	}
 
 	for i := range maxConsecutiveFailures {
@@ -305,6 +310,38 @@ func TestStartup_OtherErrorsCountTowardsTheBreaker(t *testing.T) {
 	}
 	if _, err := os.Stat(b.remote.marker); err != nil {
 		t.Errorf("tripping later didn't share it: %v", err)
+	}
+}
+
+// Without s3:ListBucket, S3 answers a lookup of a missing key with 403,
+// which gocloud reports as permission denied, so looking up a key nothing
+// writes can't show whether the bucket is usable.
+func TestStartup_S3WithoutListBucket(t *testing.T) {
+	outputID := strings.Repeat("b", 64)
+	var requests atomic.Int64
+	underlying := openFakeS3(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method != http.MethodHead || r.URL.Path != "/bucket/"+path.Join(actionDir, someAction) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("X-Amz-Meta-Output_id", outputID)
+	}))
+	b := checkedBucket(t, underlying, t.TempDir())
+
+	if got, _, err := b.OutputIDFromAction(context.Background(), someAction); got != outputID || err != nil {
+		t.Errorf("lookup = %q, %v; want the entry", got, err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("requests = %d, want the check and the lookup", got)
+	}
+	if !b.remote.allow() {
+		t.Error("bucket turned off")
+	}
+	if _, err := os.Stat(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("marker written: %v", err)
 	}
 }
 

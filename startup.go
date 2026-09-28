@@ -48,21 +48,22 @@ func (b *Bucket) useRemote() bool {
 
 // checkRemote turns the bucket off if another process sharing the local cache
 // recently found it unusable, and otherwise looks up probeKey, turning it off
-// if that fails to connect, resolve or answer within startupTimeout. Other
-// errors, such as throttling, count towards the breaker as usual, since a
-// later call may succeed.
+// if that fails to connect, resolve or answer within startupTimeout.
+//
+// Any other answer is left to the process's own calls, which count towards
+// the breaker as usual: looking up a key nothing writes only shows whether
+// the bucket can be reached. How a bucket answers for a missing key depends
+// on more than whether it's usable; S3 answers 403 to callers without
+// s3:ListBucket, which gocloud reports as permission denied.
 func (b *Bucket) checkRemote() {
 	if since, reason, ok := readRemoteDisabled(b.remote.marker); ok {
 		b.remote.disable(since, reason)
 		return
 	}
 
-	err := b.probe()
-	if unreachable(err) {
+	if err := b.probe(); unreachable(err) {
 		b.remote.trip(fmt.Errorf("checking bucket: %w", err))
-		return
 	}
-	b.remote.record(err)
 }
 
 // probe looks up probeKey, giving up after startupTimeout.
