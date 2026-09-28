@@ -49,6 +49,13 @@ func retryable(err error) bool {
 // withRetry calls op, each attempt with its own timeout, until it succeeds,
 // fails with an error that isn't retryable, or has been tried maxAttempts
 // times. op must be safe to call again after a failure.
+//
+// An attempt that can't reach the bucket turns it off at once (see
+// unreachable), rather than being retried: SDKs that retry connection
+// errors already did so within the attempt, some until its timeout, so
+// every call in flight would otherwise take several timeouts to fail, and
+// the breaker several such calls to trip. Turning the bucket off also ends
+// the attempts still in flight.
 func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(context.Context) error) error {
 	delay := retryDelay
 
@@ -57,10 +64,15 @@ func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(c
 
 	for attempt := 1; ; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		stop := context.AfterFunc(b.remote.stopped(), cancel)
 		err := op(attemptCtx)
+		stop()
 		cancel()
 
-		if err == nil || !retryable(err) || attempt >= maxAttempts || ctx.Err() != nil {
+		if unreachable(err) && ctx.Err() == nil {
+			b.remote.tripUnreachable(err)
+		}
+		if err == nil || !retryable(err) || attempt >= maxAttempts || ctx.Err() != nil || !b.remote.allow() {
 			return err
 		}
 

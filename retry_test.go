@@ -75,6 +75,22 @@ func TestWithRetry_GivesUp(t *testing.T) {
 	}
 }
 
+func TestWithRetry_StopsOnceTheBucketIsOff(t *testing.T) {
+	fastRetries(t, time.Second)
+	b := &Bucket{}
+
+	var calls int
+	err := b.withRetry(context.Background(), time.Second, func(context.Context) error {
+		calls++
+		// as another call turning the bucket off meanwhile
+		b.remote.trip(errors.New("broken"))
+		return errors.New("still broken")
+	})
+	if err == nil || calls != 1 {
+		t.Errorf("err = %v, calls = %d; want an error after 1 call", err, calls)
+	}
+}
+
 func TestWithRetry_DoesNotRetryPermanentErrors(t *testing.T) {
 	fastRetries(t, time.Second)
 	b := &Bucket{}

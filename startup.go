@@ -49,13 +49,36 @@ var startupTimeout = 15 * time.Second
 func (b *Bucket) useRemote() bool {
 	if b.remote.marker != "" {
 		b.startup.Do(b.checkRemote)
+		b.remote.checkMarker()
 	}
 	return b.remote.allow()
 }
 
+// markerCheckInterval is how often a process using the bucket looks for a
+// marker another process wrote after it started, which saves its later calls
+// each paying an attempt's timeout to find the bucket unreachable too. Only
+// calls about to use the bucket look, so a stat this often costs little.
+var markerCheckInterval = time.Second
+
+// checkMarker turns the bucket off if the marker has been written since the
+// process last looked, at most every markerCheckInterval.
+func (b *breaker) checkMarker() {
+	if !b.allow() {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := b.markerChecked.Load()
+	if now-last < int64(markerCheckInterval) || !b.markerChecked.CompareAndSwap(last, now) {
+		return
+	}
+	if since, reason, ok := readRemoteDisabled(b.marker); ok {
+		b.disable(since, reason)
+	}
+}
+
 // checkRemote turns the bucket off if another process sharing the local cache
-// recently found it unusable, and otherwise looks up probeKey, turning it off
-// if that fails to connect, resolve or answer within startupTimeout.
+// recently found it unreachable, and otherwise looks up probeKey, turning it
+// off if that fails to connect, resolve or answer within startupTimeout.
 //
 // Any other answer is left to the process's own calls, which count towards
 // the breaker as usual: looking up a key nothing writes only shows whether
@@ -69,7 +92,7 @@ func (b *Bucket) checkRemote() {
 	}
 
 	if err := b.probe(); unreachable(err) {
-		b.remote.trip(fmt.Errorf("checking bucket: %w", err))
+		b.remote.tripUnreachable(fmt.Errorf("checking bucket: %w", err))
 	}
 }
 
@@ -99,12 +122,15 @@ func (b *Bucket) probe() error {
 }
 
 // unreachable reports whether err means the bucket, or the service that
-// issues its credentials, couldn't be reached at all: a connection or DNS
-// error, or no answer in time. Errors that SDKs flatten into text, such as
-// a failed token exchange, aren't recognised, and count towards the breaker
-// as other errors do.
+// issues its credentials, couldn't be reached at all: a failure to connect
+// or resolve, or no answer in time. Failures on a connection that was made,
+// such as a reset part way through a transfer, don't count, nor does a call
+// being canceled, even if what it was retrying was a failure to connect.
+// Errors that SDKs flatten into text, such as a failed token exchange,
+// aren't recognised either, and count towards the breaker as other errors
+// do.
 func unreachable(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, context.Canceled) || gcerrors.Code(err) == gcerrors.Canceled {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || gcerrors.Code(err) == gcerrors.DeadlineExceeded {
@@ -112,8 +138,11 @@ func unreachable(err error) bool {
 	}
 
 	var opErr *net.OpError
+	if errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "proxyconnect") {
+		return true
+	}
 	var dnsErr *net.DNSError
-	if errors.As(err, &opErr) || errors.As(err, &dnsErr) {
+	if errors.As(err, &dnsErr) {
 		return true
 	}
 	var netErr net.Error
