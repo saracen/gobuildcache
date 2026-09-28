@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,11 +58,13 @@ func (f *fakeGoogle) RoundTrip(r *http.Request) (*http.Response, error) {
 	return nil, &url.Error{Op: r.Method, URL: r.URL.String(), Err: io.ErrUnexpectedEOF}
 }
 
-func TestOpenBucket_GCSDoesNotWaitForTheMetadataServer(t *testing.T) {
+// writeExternalAccount writes external_account credentials exchanging the
+// subject token "ci-id-token" at tokenURL, as workload identity federation
+// from a CI job's ID token does, and returns their path.
+func writeExternalAccount(t *testing.T, tokenURL string) string {
+	t.Helper()
 	dir := t.TempDir()
 
-	// external_account credentials, as workload identity federation from a
-	// CI job's ID token uses
 	subjectToken := filepath.Join(dir, "id_token")
 	if err := os.WriteFile(subjectToken, []byte("ci-id-token"), 0o600); err != nil {
 		t.Fatal(err)
@@ -69,7 +73,7 @@ func TestOpenBucket_GCSDoesNotWaitForTheMetadataServer(t *testing.T) {
 		"type":               "external_account",
 		"audience":           "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/pool/providers/provider",
 		"subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
-		"token_url":          "https://sts.googleapis.com/v1/token",
+		"token_url":          tokenURL,
 		"credential_source":  map[string]string{"file": subjectToken},
 	})
 	if err != nil {
@@ -79,6 +83,52 @@ func TestOpenBucket_GCSDoesNotWaitForTheMetadataServer(t *testing.T) {
 	if err := os.WriteFile(credsFile, creds, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return credsFile
+}
+
+// silentListener accepts connections and never answers on them, like a
+// service that's overloaded or wedged. It counts what it accepts.
+type silentListener struct {
+	net.Listener
+	accepted atomic.Int64
+}
+
+func newSilentListener(t *testing.T) *silentListener {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &silentListener{Listener: l}
+
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			s.accepted.Add(1)
+			mu.Lock()
+			held = append(held, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		l.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range held {
+			conn.Close()
+		}
+	})
+	return s
+}
+
+func TestOpenBucket_GCSDoesNotWaitForTheMetadataServer(t *testing.T) {
+	credsFile := writeExternalAccount(t, "https://sts.googleapis.com/v1/token")
 
 	tests := map[string]struct {
 		url      string

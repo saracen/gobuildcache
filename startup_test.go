@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"gocloud.dev/blob"
 	"gocloud.dev/blob/gcsblob"
 	"gocloud.dev/blob/memblob"
 	"gocloud.dev/gcp"
@@ -70,6 +71,13 @@ func newCheckedBucket(t *testing.T, transport http.RoundTripper, dir string) *Bu
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { underlying.Close() })
+	return checkedBucket(t, underlying, dir)
+}
+
+// checkedBucket wraps underlying as serve does, checking it at startup and
+// sharing the result through dir.
+func checkedBucket(t *testing.T, underlying *blob.Bucket, dir string) *Bucket {
+	t.Helper()
 
 	for _, sub := range []string{actionDir, outputDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
@@ -89,17 +97,21 @@ func TestStartup_UnreachableBucketIsTurnedOffAtOnce(t *testing.T) {
 	refused := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 	noHost := &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "storage.googleapis.com", IsNotFound: true}}
 
-	// held until the test ends
-	release := make(chan struct{})
-
-	tests := map[string]func(*http.Request) (*http.Response, error){
+	// The subtests run in random order, so each has its own channel, closed
+	// when it ends: with one shared channel, "never answers" answers at once
+	// unless it runs first.
+	tests := map[string]func(release <-chan struct{}) (*http.Response, error){
 		// retried by the GCS client until its context ends
-		"connection refused": func(*http.Request) (*http.Response, error) { return nil, refused },
-		"no such host":       func(*http.Request) (*http.Response, error) { return nil, noHost },
+		"connection refused": func(<-chan struct{}) (*http.Response, error) { return nil, refused },
+		"no such host":       func(<-chan struct{}) (*http.Response, error) { return nil, noHost },
 		// like a token exchange that never answers, which the request's
-		// context doesn't end
-		"never answers": func(*http.Request) (*http.Response, error) {
-			<-release
+		// context doesn't end; given up on after a while so that a check
+		// that waits for it fails rather than hangs
+		"never answers": func(release <-chan struct{}) (*http.Response, error) {
+			select {
+			case <-release:
+			case <-time.After(5 * time.Second):
+			}
 			return nil, refused
 		},
 	}
@@ -108,16 +120,11 @@ func TestStartup_UnreachableBucketIsTurnedOffAtOnce(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			quickStartup(t, 200*time.Millisecond)
 			dir := t.TempDir()
-			transport := &scriptedGCS{respond: respond}
+			release := make(chan struct{})
+			transport := &scriptedGCS{respond: func(*http.Request) (*http.Response, error) { return respond(release) }}
 			b := newCheckedBucket(t, transport, dir)
 			// before closing the bucket, which waits for calls
-			t.Cleanup(func() {
-				select {
-				case <-release:
-				default:
-					close(release)
-				}
-			})
+			t.Cleanup(func() { close(release) })
 
 			start := time.Now()
 			outputID, _, err := b.OutputIDFromAction(context.Background(), someAction)
@@ -142,6 +149,42 @@ func TestStartup_UnreachableBucketIsTurnedOffAtOnce(t *testing.T) {
 				t.Errorf("made %d more requests after turning the bucket off", got-requests)
 			}
 		})
+	}
+}
+
+// A GCS call waiting on a token exchange waits for the exchange, whatever
+// the call's own deadline, so the startup check has to give up on it itself
+// rather than wait for the token client's timeout.
+func TestStartup_TokenExchangeThatNeverAnswers(t *testing.T) {
+	quickStartup(t, 200*time.Millisecond)
+	// the token client's timeout, which is taken when the bucket is opened
+	fastRetries(t, 5*time.Second)
+
+	sts := newSilentListener(t)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", writeExternalAccount(t, "http://"+sts.Addr().String()+"/v1/token"))
+	t.Setenv("STORAGE_EMULATOR_HOST", "")
+
+	underlying, err := openBucket(context.Background(), "gs://bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := checkedBucket(t, underlying, t.TempDir())
+
+	start := time.Now()
+	if outputID, _, err := b.OutputIDFromAction(context.Background(), someAction); outputID != "" || err != nil {
+		t.Errorf("lookup = %q, %v; want a miss", outputID, err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("lookup took %v, want about the startup timeout", took)
+	}
+	if sts.accepted.Load() == 0 {
+		t.Error("no token exchange was attempted")
+	}
+	if b.remote.allow() {
+		t.Error("bucket still in use")
+	}
+	if _, err := os.Stat(b.remote.marker); err != nil {
+		t.Errorf("marker: %v", err)
 	}
 }
 
