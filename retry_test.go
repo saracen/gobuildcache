@@ -211,7 +211,7 @@ func TestGCS_PersistentReadFailuresReturn(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := b.OutputIDFromAction(ctx, strings.Repeat("a", 64))
+		_, _, err := b.OutputIDFromAction(ctx, strings.Repeat("a", 64))
 		done <- err
 	}()
 

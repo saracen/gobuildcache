@@ -2,6 +2,7 @@ package main
 
 import (
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,17 +78,7 @@ func TestEndToEnd(t *testing.T) {
 func TestEndToEnd_CleanTestcache(t *testing.T) {
 	tmp := t.TempDir()
 	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
-
-	// The test's output is different every time it runs, but not what the go
-	// command keys its result on, so the output shows which run a cached
-	// result is from.
-	mod := filepath.Join(tmp, "mod")
-	writeModule(t, mod, map[string]string{
-		"go.mod":        "module example.com/stamp\n\ngo 1.24\n",
-		"stamp_test.go": "package stamp\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestStamp(t *testing.T) { fmt.Printf(\"stamp %d\\n\", time.Now().UnixNano()) }\n",
-	})
-
-	stampLine := regexp.MustCompile(`(?m)^stamp (\d+)$`)
+	mod := writeStampModule(t, tmp)
 
 	// job runs the test in a fresh job, with its own local cache and GOCACHE,
 	// returning which run's result it got and whether it was cached.
@@ -96,30 +87,9 @@ func TestEndToEnd_CleanTestcache(t *testing.T) {
 
 		env := jobEnv(tmp, name, bin, bucketURL, "-stats")
 		if clean {
-			// go clean -testcache silently does nothing without GOCACHE
-			if err := os.MkdirAll(filepath.Join(tmp, name+"-gocache"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			cmd := exec.Command(goBin, "clean", "-testcache")
-			cmd.Dir = mod
-			cmd.Env = env
-			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("%s: go clean -testcache: %v\n%s", name, err, out)
-			}
+			goCleanTestcache(t, goBin, mod, env)
 		}
-
-		cmd := exec.Command(goBin, "test", "-v", "./...")
-		cmd.Dir = mod
-		cmd.Env = env
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s: go test: %v\n%s", name, err, out)
-		}
-		m := stampLine.FindStringSubmatch(string(out))
-		if m == nil {
-			t.Fatalf("%s: no stamp in output:\n%s", name, out)
-		}
-		return m[1], strings.Contains(string(out), "(cached)"), parseStats(t, string(out))
+		return goTestStamp(t, goBin, mod, env)
 	}
 
 	first, cached, _ := job("first", false)
@@ -141,6 +111,119 @@ func TestEndToEnd_CleanTestcache(t *testing.T) {
 
 	if got, cached, _ := job("later", false); !cached || got != rerun {
 		t.Errorf("later job: cached=%v from run %s, want cached from the rerun %s", cached, got, rerun)
+	}
+}
+
+// TestEndToEnd_ExpireTestResultsWithConcurrentWriters checks what the README
+// says about jobs that must rerun every test while other jobs write to the
+// bucket. "go clean -testcache" only expires results put before it ran, so
+// such a job replays a result another job puts after that; writing an expiry
+// in the far future instead reruns everything, and still stores the results.
+func TestEndToEnd_ExpireTestResultsWithConcurrentWriters(t *testing.T) {
+	tmp := t.TempDir()
+	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
+	mod := writeStampModule(t, tmp)
+	env := func(name string) []string { return jobEnv(tmp, name, bin, bucketURL, "-stats") }
+
+	if _, cached, _ := goTestStamp(t, goBin, mod, env("first")); cached {
+		t.Fatal("first job's test result was cached")
+	}
+
+	// A job cleans, then another cleans and tests, before the first tests.
+	goCleanTestcache(t, goBin, mod, env("cleaned"))
+	goCleanTestcache(t, goBin, mod, env("other"))
+	other, cached, _ := goTestStamp(t, goBin, mod, env("other"))
+	if cached {
+		t.Fatal("other job's test result was cached after go clean -testcache")
+	}
+	if got, cached, _ := goTestStamp(t, goBin, mod, env("cleaned")); !cached || got != other {
+		t.Errorf("cleaned job: cached=%v from run %s, want cached from the other job's run %s; if the go command no longer replays it, update the README", cached, got, other)
+	}
+
+	// The same, expiring every test result instead.
+	gocache := filepath.Join(tmp, "expired-gocache")
+	if err := os.MkdirAll(gocache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gocache, "testexpire.txt"), []byte(strconv.FormatInt(math.MaxInt64, 10)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	goCleanTestcache(t, goBin, mod, env("other2"))
+	other, cached, _ = goTestStamp(t, goBin, mod, env("other2"))
+	if cached {
+		t.Fatal("other job's test result was cached after go clean -testcache")
+	}
+	// the go command never lowers the expiry
+	goCleanTestcache(t, goBin, mod, env("expired"))
+	expired, cached, stats := goTestStamp(t, goBin, mod, env("expired"))
+	if cached || expired == other {
+		t.Fatalf("job with a far-future expiry: cached=%v from run %s, want a rerun", cached, expired)
+	}
+	if stats["uploads"] == 0 || stats["upload_errors"] != 0 {
+		t.Errorf("rerun wasn't stored: %v", stats)
+	}
+
+	if got, cached, _ := goTestStamp(t, goBin, mod, env("later")); !cached || got != expired {
+		t.Errorf("later job: cached=%v from run %s, want cached from the rerun %s", cached, got, expired)
+	}
+}
+
+// writeStampModule writes a module whose test's output is different every
+// time it runs, but not what the go command keys its result on, so the output
+// shows which run a cached result is from.
+func writeStampModule(t *testing.T, tmp string) string {
+	t.Helper()
+
+	mod := filepath.Join(tmp, "mod")
+	writeModule(t, mod, map[string]string{
+		"go.mod":        "module example.com/stamp\n\ngo 1.24\n",
+		"stamp_test.go": "package stamp\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestStamp(t *testing.T) { fmt.Printf(\"stamp %d\\n\", time.Now().UnixNano()) }\n",
+	})
+	return mod
+}
+
+var stampLine = regexp.MustCompile(`(?m)^stamp (\d+)$`)
+
+// goTestStamp tests the stamp module in mod, returning which run's result it
+// got, whether it was cached, and gobuildcache's stats.
+func goTestStamp(t *testing.T, goBin, mod string, env []string) (string, bool, map[string]int64) {
+	t.Helper()
+
+	cmd := exec.Command(goBin, "test", "-v", "./...")
+	cmd.Dir = mod
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go test: %v\n%s", err, out)
+	}
+	m := stampLine.FindStringSubmatch(string(out))
+	if m == nil {
+		t.Fatalf("no stamp in output:\n%s", out)
+	}
+	return m[1], strings.Contains(string(out), "(cached)"), parseStats(t, string(out))
+}
+
+// goCleanTestcache runs "go clean -testcache", creating GOCACHE first: without
+// it, the go command silently does nothing.
+func goCleanTestcache(t *testing.T, goBin, mod string, env []string) {
+	t.Helper()
+
+	cmd := exec.Command(goBin, "env", "GOCACHE")
+	cmd.Dir = mod
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go env GOCACHE: %v", err)
+	}
+	if err := os.MkdirAll(strings.TrimSpace(string(out)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd = exec.Command(goBin, "clean", "-testcache")
+	cmd.Dir = mod
+	cmd.Env = env
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go clean -testcache: %v\n%s", err, out)
 	}
 }
 

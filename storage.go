@@ -72,7 +72,7 @@ type Storage interface {
 	PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error)
 	GetOutput(ctx context.Context, outputID string) (string, error)
 
-	OutputIDFromAction(ctx context.Context, actionID string) (string, error)
+	OutputIDFromAction(ctx context.Context, actionID string) (string, time.Time, error)
 	LinkActionToOutput(ctx context.Context, actionID, outputID string) error
 }
 
@@ -162,55 +162,61 @@ func (d *Disk) GetOutput(ctx context.Context, outputID string) (string, error) {
 	return filepath.Join(d.cacheDir, outputDir, outputID), nil
 }
 
-func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string, error) {
+// OutputIDFromAction returns the output ID actionID is linked to and when its
+// entry was put, or "" if it isn't linked.
+func (d *Disk) OutputIDFromAction(ctx context.Context, actionID string) (string, time.Time, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
 
-	outputID, err := readActionLink(actionPathname)
+	outputID, putTime, err := readActionLink(actionPathname)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
+		return "", time.Time{}, nil
 	}
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 
 	if !isValidID(outputID) {
-		return "", fmt.Errorf("invalid output id %q in action link %s", outputID, actionPathname)
+		return "", time.Time{}, fmt.Errorf("invalid output id %q in action link %s", outputID, actionPathname)
 	}
-	return outputID, nil
+	return outputID, putTime, nil
 }
 
-// readActionLink returns the output ID an action link refers to. Links are
-// files containing the output ID; older versions used symlinks to the output,
-// which aren't reliably available on Windows.
-func readActionLink(pathname string) (string, error) {
+// readActionLink returns the output ID an action link refers to and when its
+// entry was put, which is the link's modification time. Links are files
+// containing the output ID; older versions used symlinks to the output, which
+// aren't reliably available on Windows, and didn't record put times.
+func readActionLink(pathname string) (string, time.Time, error) {
 	fi, err := os.Lstat(pathname)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 
 	if fi.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(pathname)
 		if err != nil {
-			return "", err
+			return "", time.Time{}, err
 		}
-		return filepath.Base(target), nil
+		return filepath.Base(target), unknownPutTime, nil
 	}
 
-	data, err := os.ReadFile(pathname)
+	// Both come from the same open file: a put renames a new link into place,
+	// so reading them separately could pair one put's output with another's
+	// time.
+	f, err := os.Open(pathname)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	return string(bytes.TrimSpace(data)), nil
-}
+	defer f.Close()
 
-// PutTime returns when actionID's entry was put, which is its action link's
-// modification time.
-func (d *Disk) PutTime(actionID string) (time.Time, error) {
-	fi, err := os.Lstat(filepath.Join(d.cacheDir, actionDir, actionID))
+	fi, err = f.Stat()
 	if err != nil {
-		return time.Time{}, err
+		return "", time.Time{}, err
 	}
-	return fi.ModTime(), nil
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return string(bytes.TrimSpace(data)), fi.ModTime(), nil
 }
 
 // LinkActionToOutput links actionID to outputID, recording that the entry was
@@ -220,7 +226,7 @@ func (d *Disk) PutTime(actionID string) (time.Time, error) {
 func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string, putTime time.Time) (bool, error) {
 	actionPathname := filepath.Join(d.cacheDir, actionDir, actionID)
 
-	existing, err := readActionLink(actionPathname)
+	existing, _, err := readActionLink(actionPathname)
 	exists := err == nil && existing == outputID
 
 	// Write to a temporary file and rename, so readers never see a partial link
@@ -254,15 +260,18 @@ func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string
 	return exists, nil
 }
 
-func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (string, error) {
-	outputID, err := b.disk.OutputIDFromAction(ctx, actionID)
+// OutputIDFromAction returns the output ID actionID is linked to and when its
+// entry was put, from the local cache or else the bucket, or "" if it isn't
+// linked.
+func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (string, time.Time, error) {
+	outputID, putTime, err := b.disk.OutputIDFromAction(ctx, actionID)
 	if err != nil {
-		return "", fmt.Errorf("output id from action (disk): %w", err)
+		return "", time.Time{}, fmt.Errorf("output id from action (disk): %w", err)
 	}
 
 	if outputID != "" {
 		slog.Debug("returning output id", "action", actionID, "output", outputID)
-		return outputID, nil
+		return outputID, putTime, nil
 	}
 
 	// TODO: come up with a better solution for this scenario
@@ -274,13 +283,13 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	if fi, err := os.Stat(cacheEmptyOutputPath); err == nil {
 		if time.Since(fi.ModTime()) < emptyMarkerTTL {
 			slog.Debug("empty found", "action", actionID, "output", outputID)
-			return "", nil
+			return "", time.Time{}, nil
 		}
 		slog.Debug("empty marker expired", "action", actionID)
 	}
 
 	if !b.remote.allow() {
-		return "", nil
+		return "", time.Time{}, nil
 	}
 
 	b.stats.RemoteLookups.Add(1)
@@ -297,22 +306,22 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		if err := os.WriteFile(cacheEmptyOutputPath, nil, 0o600); err != nil {
 			slog.Warn("writing empty marker", "action", actionID, "err", err)
 		}
-		return "", nil
+		return "", time.Time{}, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("attribute for %v: %w", actionID, err)
+		return "", time.Time{}, fmt.Errorf("attribute for %v: %w", actionID, err)
 	}
 
 	outputID = attr.Metadata["output_id"]
 	if outputID == "" {
 		slog.Debug("no metadata output id", "action", actionID, "output", outputID)
-		return "", nil
+		return "", time.Time{}, nil
 	}
 	if !isValidID(outputID) {
-		return "", fmt.Errorf("invalid output_id %q in bucket metadata for action %s", outputID, actionID)
+		return "", time.Time{}, fmt.Errorf("invalid output_id %q in bucket metadata for action %s", outputID, actionID)
 	}
 
-	putTime := unknownPutTime
+	putTime = unknownPutTime
 	metadata := map[string]string{"output_id": outputID}
 	if v, ok := attr.Metadata[putTimeKey]; ok {
 		if ns, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -337,7 +346,7 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		slog.Warn("linking action to output", "action", actionID, "output", outputID, "err", err)
 	}
 
-	return outputID, nil
+	return outputID, putTime, nil
 }
 
 func (b *Bucket) LinkActionToOutput(ctx context.Context, actionID, outputID string) (bool, error) {

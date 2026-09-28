@@ -81,7 +81,7 @@ func getThroughCacher(t *testing.T, b *Bucket, actionID string) string {
 	t.Helper()
 	ctx := context.Background()
 
-	outputID, err := b.OutputIDFromAction(ctx, actionID)
+	outputID, _, err := b.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestRefresh_OldObjectsAreRefreshedOnHit(t *testing.T) {
 	}
 
 	// refreshing isn't putting
-	if got, err := b.disk.PutTime(actionID); err != nil || !got.Equal(old) {
+	if _, got, err := b.disk.OutputIDFromAction(context.Background(), actionID); err != nil || !got.Equal(old) {
 		t.Errorf("put time = %v, %v; want %v", got, err, old)
 	}
 }
@@ -177,7 +177,7 @@ func TestRefresh_S3KeepsPutTime(t *testing.T) {
 
 	b := &Bucket{disk: newDisk(t), bucket: underlying, refreshAfter: time.Hour}
 	b.Start(context.Background())
-	if got, err := b.OutputIDFromAction(context.Background(), actionID); err != nil || got != outputID {
+	if got, _, err := b.OutputIDFromAction(context.Background(), actionID); err != nil || got != outputID {
 		t.Fatalf("OutputIDFromAction = %q, %v", got, err)
 	}
 	b.Close()

@@ -122,7 +122,7 @@ func TestDiskGetOutput(t *testing.T) {
 
 func TestDiskOutputIDFromAction_Missing(t *testing.T) {
 	d := newDisk(t)
-	got, err := d.OutputIDFromAction(context.Background(), "nope")
+	got, _, err := d.OutputIDFromAction(context.Background(), "nope")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestDiskOutputIDFromAction_RejectsInvalidLink(t *testing.T) {
 	if err := os.Symlink("../../etc/passwd", actionPath); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.OutputIDFromAction(context.Background(), actionID); err == nil {
+	if _, _, err := d.OutputIDFromAction(context.Background(), actionID); err == nil {
 		t.Error("expected error for invalid symlink target")
 	}
 }
@@ -158,7 +158,7 @@ func TestDiskLinkActionToOutput(t *testing.T) {
 		t.Error("expected exists=false on first link")
 	}
 
-	got, err := d.OutputIDFromAction(ctx, actionID)
+	got, _, err := d.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestDiskLinkActionToOutput(t *testing.T) {
 	if exists {
 		t.Error("expected exists=false when target changes")
 	}
-	got, err = d.OutputIDFromAction(ctx, actionID)
+	got, _, err = d.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,8 +204,8 @@ func TestDiskLinkActionToOutput_RecordsPutTime(t *testing.T) {
 	if _, err := d.LinkActionToOutput(ctx, actionID, outputID, first); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := d.PutTime(actionID); err != nil || !got.Equal(first) {
-		t.Errorf("PutTime = %v, %v; want %v", got, err, first)
+	if _, got, err := d.OutputIDFromAction(ctx, actionID); err != nil || !got.Equal(first) {
+		t.Errorf("put time = %v, %v; want %v", got, err, first)
 	}
 
 	// the same entry put again is newer
@@ -217,12 +217,8 @@ func TestDiskLinkActionToOutput_RecordsPutTime(t *testing.T) {
 	if !exists {
 		t.Error("expected exists=true for an unchanged link")
 	}
-	if got, err := d.PutTime(actionID); err != nil || !got.Equal(second) {
-		t.Errorf("PutTime after re-put = %v, %v; want %v", got, err, second)
-	}
-
-	if _, err := d.PutTime(strings.Repeat("c", 64)); err == nil {
-		t.Error("expected an error for an action that isn't linked")
+	if _, got, err := d.OutputIDFromAction(ctx, actionID); err != nil || !got.Equal(second) {
+		t.Errorf("put time after re-put = %v, %v; want %v", got, err, second)
 	}
 }
 
@@ -479,7 +475,7 @@ func TestBucketOutputIDFromAction_RejectsBadMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := b.OutputIDFromAction(ctx, actionID); err == nil {
+	if _, _, err := b.OutputIDFromAction(ctx, actionID); err == nil {
 		t.Error("expected error for invalid metadata output_id")
 	}
 }
@@ -497,7 +493,7 @@ func TestBucketOutputIDFromAction_FromMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := b.OutputIDFromAction(ctx, actionID)
+	got, _, err := b.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +502,7 @@ func TestBucketOutputIDFromAction_FromMetadata(t *testing.T) {
 	}
 
 	// Disk symlink should now exist for fast subsequent lookups.
-	diskGot, err := b.disk.OutputIDFromAction(ctx, actionID)
+	diskGot, _, err := b.disk.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,11 +539,14 @@ func TestBucketOutputIDFromAction_RestoresPutTime(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if got, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
-				t.Fatalf("OutputIDFromAction = %q, %v", got, err)
+			got, putTime, err := b.OutputIDFromAction(ctx, actionID)
+			if err != nil || got != outputID || !putTime.Equal(tc.want) {
+				t.Fatalf("OutputIDFromAction = %q, %v, %v; want %q put at %v", got, putTime, err, outputID, tc.want)
 			}
-			if got, err := b.disk.PutTime(actionID); err != nil || !got.Equal(tc.want) {
-				t.Errorf("PutTime = %v, %v; want %v", got, err, tc.want)
+
+			// and so do later gets, from the local cache
+			if _, putTime, err := b.disk.OutputIDFromAction(ctx, actionID); err != nil || !putTime.Equal(tc.want) {
+				t.Errorf("local put time = %v, %v; want %v", putTime, err, tc.want)
 			}
 		})
 	}
@@ -577,7 +576,7 @@ func TestBucketLinkActionToOutput_RePutUploadsNewPutTime(t *testing.T) {
 	// reruns the test and puts the same output again.
 	b := &Bucket{disk: newDisk(t), bucket: underlying}
 	b.Start(ctx)
-	if got, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
+	if got, _, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
 		t.Fatalf("OutputIDFromAction = %q, %v", got, err)
 	}
 	if _, err := b.GetOutput(ctx, outputID); err != nil {
@@ -592,7 +591,7 @@ func TestBucketLinkActionToOutput_RePutUploadsNewPutTime(t *testing.T) {
 	}
 	b.Close()
 
-	local, err := b.disk.PutTime(actionID)
+	_, local, err := b.disk.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +623,7 @@ func TestBucketOutputIDFromAction_EmptyMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := b.OutputIDFromAction(ctx, actionID)
+	got, _, err := b.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -640,7 +639,7 @@ func TestBucketOutputIDFromAction_EmptyMarkerTTL(t *testing.T) {
 	actionID := strings.Repeat("a", 64)
 
 	// First call: bucket miss writes marker.
-	got, err := b.OutputIDFromAction(ctx, actionID)
+	got, _, err := b.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +660,7 @@ func TestBucketOutputIDFromAction_EmptyMarkerTTL(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, err = b.OutputIDFromAction(ctx, actionID)
+	got, _, err = b.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +673,7 @@ func TestBucketOutputIDFromAction_EmptyMarkerTTL(t *testing.T) {
 	if err := os.Chtimes(markerPath, past, past); err != nil {
 		t.Fatal(err)
 	}
-	got, err = b.OutputIDFromAction(ctx, actionID)
+	got, _, err = b.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -771,12 +770,16 @@ func TestDiskOutputIDFromAction_LegacySymlink(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	got, err := d.OutputIDFromAction(ctx, actionID)
+	got, putTime, err := d.OutputIDFromAction(ctx, actionID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != outputID {
 		t.Errorf("got %q, want %q", got, outputID)
+	}
+	// symlinks don't record when they were put
+	if !putTime.Equal(unknownPutTime) {
+		t.Errorf("put time = %v, want %v", putTime, unknownPutTime)
 	}
 
 	// Relinking replaces the legacy symlink with a file.
@@ -784,7 +787,7 @@ func TestDiskOutputIDFromAction_LegacySymlink(t *testing.T) {
 	if _, err := d.LinkActionToOutput(ctx, actionID, newOutput, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := d.OutputIDFromAction(ctx, actionID); got != newOutput {
+	if got, _, _ := d.OutputIDFromAction(ctx, actionID); got != newOutput {
 		t.Errorf("got %q, want %q after relink", got, newOutput)
 	}
 }
@@ -796,7 +799,7 @@ func TestDiskOutputIDFromAction_RejectsInvalidFile(t *testing.T) {
 	if err := os.WriteFile(actionPath, []byte("../../etc/passwd"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.OutputIDFromAction(context.Background(), actionID); err == nil {
+	if _, _, err := d.OutputIDFromAction(context.Background(), actionID); err == nil {
 		t.Error("expected error for invalid link contents")
 	}
 }
@@ -815,7 +818,7 @@ func TestBucket_BreakerStopsUsingFailingBucket(t *testing.T) {
 	t.Cleanup(b.Close)
 
 	for i := range maxConsecutiveFailures + 3 {
-		_, err := b.OutputIDFromAction(ctx, fmt.Sprintf("%064x", i))
+		_, _, err := b.OutputIDFromAction(ctx, fmt.Sprintf("%064x", i))
 		if i < maxConsecutiveFailures && err == nil {
 			t.Fatalf("lookup %d: expected error from failing bucket", i)
 		}
@@ -840,7 +843,7 @@ func TestBucket_BreakerStopsUsingFailingBucket(t *testing.T) {
 	}
 	b.Close()
 
-	if got, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
+	if got, _, err := b.OutputIDFromAction(ctx, actionID); err != nil || got != outputID {
 		t.Errorf("local lookup = %q, %v; want %q", got, err, outputID)
 	}
 	if got := b.stats.UploadErrors.Load(); got != 0 {

@@ -10,8 +10,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -83,7 +85,7 @@ func TestCacher_PutGetRoundTrip(t *testing.T) {
 		t.Errorf("on-disk content mismatch")
 	}
 
-	got, err := c.Get(ctx, &request{ActionID: actionID})
+	got, _, err := c.Get(ctx, &request{ActionID: actionID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +98,7 @@ func TestCacher_GetMiss(t *testing.T) {
 	ctx := context.Background()
 	c := newCacher(t)
 
-	got, err := c.Get(ctx, &request{ActionID: bytes.Repeat([]byte{0xab}, 32)})
+	got, _, err := c.Get(ctx, &request{ActionID: bytes.Repeat([]byte{0xab}, 32)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,6 +244,105 @@ func TestHandleRequest_GetReportsPutTime(t *testing.T) {
 	// and so do later gets, from its local cache
 	if again := handleRequest(ctx, reader, get); again.Time == nil || !again.Time.Equal(*local.Time) {
 		t.Errorf("second remote get Time = %v, want %v", again.Time, local.Time)
+	}
+}
+
+// TestHandleRequest_GetFromBucketWithoutLocalLink checks that a bucket hit
+// whose action link can't be kept locally is still a hit, put when the bucket
+// says. Writing the local link is only an optimisation for later gets.
+func TestHandleRequest_GetFromBucketWithoutLocalLink(t *testing.T) {
+	ctx := context.Background()
+	underlying := memblob.OpenBucket(nil)
+	t.Cleanup(func() { underlying.Close() })
+
+	content := []byte("test result")
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+	putTime := time.Unix(1700000000, 0)
+	if err := underlying.WriteAll(ctx, path.Join(outputDir, hashID(content)), content, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := underlying.WriteAll(ctx, path.Join(actionDir, hex.EncodeToString(actionID)), nil, &blob.WriterOptions{
+		Metadata: map[string]string{"output_id": hashID(content), putTimeKey: strconv.FormatInt(putTime.UnixNano(), 10)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// without its action directory, the reader can't write action links
+	reader := newCacherOn(t, underlying)
+	if err := os.RemoveAll(filepath.Join(reader.disk.cacheDir, actionDir)); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := handleRequest(ctx, reader, &request{ID: 1, Command: cmdGet, ActionID: actionID})
+	if resp.Miss || resp.Err != "" || resp.Time == nil || !resp.Time.Equal(putTime) {
+		t.Fatalf("get = %+v, want a hit put at %v", resp, putTime)
+	}
+	if hits, errs := reader.bucket.stats.Hits.Load(), reader.bucket.stats.GetErrors.Load(); hits != 1 || errs != 0 {
+		t.Errorf("hits=%d get_errors=%d, want 1 and 0", hits, errs)
+	}
+}
+
+// TestHandleRequest_GetTimeMatchesOutput checks that a get reports the put
+// time of the output it returns while another process sharing the local cache
+// relinks the action. Pairing an output put before a "go clean -testcache"
+// with a later put time would replay a result that should rerun.
+func TestHandleRequest_GetTimeMatchesOutput(t *testing.T) {
+	ctx := context.Background()
+	c := newCacher(t)
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+
+	// two outputs of the same action, put at different times
+	putTimes := map[string]time.Time{}
+	var outputIDs []string
+	for i, content := range []string{"first", "second"} {
+		resp := handleRequest(ctx, c, &request{
+			ID: int64(i), Command: cmdPut, ActionID: actionID, OutputID: sha256Bytes([]byte(content)),
+			Body: strings.NewReader(content), BodySize: int64(len(content)),
+		})
+		if resp.Err != "" {
+			t.Fatal(resp.Err)
+		}
+		outputID := hashID([]byte(content))
+		outputIDs = append(outputIDs, outputID)
+		putTimes[outputID] = time.Unix(1700000000+int64(i)*3600, 0)
+	}
+	if _, err := c.disk.LinkActionToOutput(ctx, hex.EncodeToString(actionID), outputIDs[0], putTimes[outputIDs[0]]); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	relinked := make(chan error, 1)
+	go func() {
+		defer close(relinked)
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			outputID := outputIDs[i%2]
+			if _, err := c.disk.LinkActionToOutput(ctx, hex.EncodeToString(actionID), outputID, putTimes[outputID]); err != nil {
+				relinked <- err
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(done)
+		if err := <-relinked; err != nil {
+			t.Errorf("relinking: %v", err)
+		}
+	}()
+
+	for i := 0; i < 2000; i++ {
+		resp := handleRequest(ctx, c, &request{ID: 1, Command: cmdGet, ActionID: actionID})
+		if resp.Miss || resp.Err != "" || resp.Time == nil {
+			t.Fatalf("get = %+v", resp)
+		}
+		outputID := hex.EncodeToString(resp.OutputID)
+		if want := putTimes[outputID]; !resp.Time.Equal(want) {
+			t.Fatalf("get %d returned output %s with put time %v, want %v", i, outputID, resp.Time, want)
+		}
 	}
 }
 

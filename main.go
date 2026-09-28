@@ -75,40 +75,49 @@ type Cacher struct {
 	claims *claims
 }
 
-func (c *Cacher) Get(ctx context.Context, req *request) (string, error) {
+// Get returns the path of the action's output, or "" on a miss, and when its
+// entry was put. The go command expires test results put before the last "go
+// clean -testcache" by that time, so for an entry from the bucket it must be
+// the original put, not the download.
+func (c *Cacher) Get(ctx context.Context, req *request) (string, time.Time, error) {
 	actionID := hex.EncodeToString(req.ActionID)
 
-	pathname, err := c.get(ctx, actionID)
+	pathname, putTime, err := c.get(ctx, actionID)
 	if err != nil || pathname != "" || c.claims == nil {
-		return pathname, err
+		return pathname, putTime, err
 	}
 
-	return c.claims.awaitOrClaim(ctx, actionID, func() string { return c.localHit(actionID) }), nil
+	pathname = c.claims.awaitOrClaim(ctx, actionID, func() string {
+		pathname, putTime = c.localHit(actionID)
+		return pathname
+	})
+	return pathname, putTime, nil
 }
 
-// localHit returns the path of actionID's output if it's in the local cache.
-func (c *Cacher) localHit(actionID string) string {
-	outputID, err := c.disk.OutputIDFromAction(context.Background(), actionID)
+// localHit returns the path of actionID's output and when it was put if it's
+// in the local cache.
+func (c *Cacher) localHit(actionID string) (string, time.Time) {
+	outputID, putTime, err := c.disk.OutputIDFromAction(context.Background(), actionID)
 	if err != nil || outputID == "" {
-		return ""
+		return "", time.Time{}
 	}
 
 	pathname := filepath.Join(c.disk.cacheDir, outputDir, outputID)
 	if _, err := os.Stat(pathname); err != nil {
-		return ""
+		return "", time.Time{}
 	}
-	return pathname
+	return pathname, putTime
 }
 
-func (c *Cacher) get(ctx context.Context, actionID string) (string, error) {
+func (c *Cacher) get(ctx context.Context, actionID string) (string, time.Time, error) {
 	slog.Debug("get", "action", actionID)
 
-	outputID, err := c.bucket.OutputIDFromAction(ctx, actionID)
+	outputID, putTime, err := c.bucket.OutputIDFromAction(ctx, actionID)
 	if err != nil {
-		return "", fmt.Errorf("getting output id from action (bucket): %w", err)
+		return "", time.Time{}, fmt.Errorf("getting output id from action (bucket): %w", err)
 	}
 	if outputID == "" {
-		return "", nil
+		return "", time.Time{}, nil
 	}
 
 	slog.Debug("single flight get", "action", actionID, "output", outputID)
@@ -121,7 +130,7 @@ func (c *Cacher) get(ctx context.Context, actionID string) (string, error) {
 		slog.Debug("get output shared", "output", outputID)
 	}
 
-	return pathname.(string), err
+	return pathname.(string), putTime, err
 }
 
 func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
@@ -294,9 +303,10 @@ func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
 	case cmdGet:
 		c.bucket.stats.Gets.Add(1)
 		now := time.Now()
-		resp.DiskPath, err = c.Get(ctx, req)
+		var putTime time.Time
+		resp.DiskPath, putTime, err = c.Get(ctx, req)
 		if err == nil && resp.DiskPath != "" {
-			resp.Time, err = c.putTime(req)
+			resp.Time = &putTime
 		}
 		switch {
 		case err != nil:
@@ -332,17 +342,6 @@ func handleRequest(ctx context.Context, c *Cacher, req *request) *response {
 
 	populateFileInfo(req, resp)
 	return resp
-}
-
-// putTime returns when a get hit's entry was put. The go command expires test
-// results put before the last "go clean -testcache" by it, so for an entry
-// from the bucket it must be the original put, not the download.
-func (c *Cacher) putTime(req *request) (*time.Time, error) {
-	t, err := c.disk.PutTime(hex.EncodeToString(req.ActionID))
-	if err != nil {
-		return nil, fmt.Errorf("getting put time: %w", err)
-	}
-	return &t, nil
 }
 
 // populateFileInfo fills Size/OutputID from the on-disk artifact named by

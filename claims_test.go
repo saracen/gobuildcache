@@ -53,7 +53,7 @@ func sharedDir(t *testing.T) (string, *blob.Bucket) {
 func get(t *testing.T, c *Cacher, actionID []byte) string {
 	t.Helper()
 
-	pathname, err := c.Get(context.Background(), &request{ActionID: actionID})
+	pathname, _, err := c.Get(context.Background(), &request{ActionID: actionID})
 	if err != nil {
 		t.Fatal(err)
 	}

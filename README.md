@@ -42,10 +42,11 @@ Set every checked-out file's modification time to something stable and in the pa
 
 ## rerunning cached tests
 
-`go clean -testcache` expires the test results put before it ran, including ones from the bucket, so a job can rerun every test and, unless it's `-readonly`, store the results for jobs that don't. The go command decides by the time an entry was put, so gobuildcache records it on each action link it uploads (`put_time` metadata) and reports that, not when the entry was downloaded. Refreshing an entry keeps its put time.
+`go clean -testcache` expires the test results put before it ran, including ones from the bucket, and unless it's `-readonly`, the job stores the results of rerunning them for later jobs. The go command decides by the time an entry was put, so gobuildcache records it on each action link it uploads (`put_time` metadata) and reports that, not when the entry was downloaded. Refreshing an entry keeps its put time.
 
 - `go clean -testcache` silently does nothing if `GOCACHE` doesn't exist yet, as in a fresh CI job, so create it first: `mkdir -p "$(go env GOCACHE)"`.
 - Entries uploaded by versions of gobuildcache that didn't record put times are always expired by `go clean -testcache`, because when they were put isn't known. Their modification time isn't used instead, since refreshing changes it. Results from rerunning them are stored with a put time.
+- Results put after `go clean -testcache` ran aren't expired, including ones that other jobs upload while the job runs. So a job doesn't rerun every test if another job writing to the bucket runs the same tests at the same time, such as a pipeline for an overlapping change: for a test with inputs the go command can't see, it can replay the other job's result, from different inputs. To expire every result, write an expiry far in the future instead, before running `go`: `mkdir -p "$(go env GOCACHE)" && echo 9223372036854775807 > "$(go env GOCACHE)/testexpire.txt"`. That's the go command's internal file for `go clean -testcache`, holding Unix nanoseconds, not a documented interface; `go clean -testcache` never lowers it. The job's results are still stored for jobs without it.
 
 ## retries and timeouts
 
