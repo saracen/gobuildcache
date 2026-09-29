@@ -85,14 +85,25 @@ func bucketKeys(t *testing.T, underlying *blob.Bucket) []string {
 	}
 }
 
-func TestServe_DeltaRequiresReadonly(t *testing.T) {
+func TestServe_DeltaOptions(t *testing.T) {
 	underlying := memblob.OpenBucket(nil)
 	defer underlying.Close()
 
-	opts := options{cacheDir: t.TempDir(), deltaDir: t.TempDir()}
-	err := serve(context.Background(), underlying, opts, strings.NewReader(""), io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "-delta-dir requires -readonly") {
-		t.Errorf("serve with -delta-dir and without -readonly: %v", err)
+	for _, tc := range []struct {
+		name string
+		opts options
+		want string
+	}{
+		{name: "without -readonly", opts: options{}, want: "-delta-dir requires -readonly"},
+		{name: "with -expire-others", opts: options{readonly: true, expireOthers: true}, want: "-delta-dir can't be used with -expire-others"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.opts.cacheDir, tc.opts.deltaDir = t.TempDir(), t.TempDir()
+			err := serve(context.Background(), underlying, tc.opts, strings.NewReader(""), io.Discard)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("serve: %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -238,8 +249,7 @@ func TestCacher_DeltaRePut(t *testing.T) {
 }
 
 // TestCacher_DeltaPutTimes checks that entries in the delta are reported as
-// put when they were, and with -expire-others as put at unknownPutTime by
-// processes that didn't put them, like entries in -dir.
+// put when they were, like entries in -dir.
 func TestCacher_DeltaPutTimes(t *testing.T) {
 	ctx := context.Background()
 	deltaDir := t.TempDir()
@@ -248,32 +258,21 @@ func TestCacher_DeltaPutTimes(t *testing.T) {
 
 	actionID := bytes.Repeat([]byte{0xaa}, 32)
 	putter := newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0)
-	putter.expireOthers = true
 	before := time.Now()
 	put(t, putter, actionID, []byte("test result"))
 	after := time.Now()
 
 	for _, tc := range []struct {
-		name         string
-		c            *Cacher
-		expireOthers bool
-		wantPut      bool
+		name string
+		c    *Cacher
 	}{
-		{name: "putting process", c: putter, wantPut: true},
-		{name: "another process", c: newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0), wantPut: true},
-		{name: "another process with -expire-others", c: newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0), expireOthers: true},
+		{name: "putting process", c: putter},
+		{name: "another process", c: newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.c.expireOthers = tc.c.expireOthers || tc.expireOthers
 			_, putTime, err := tc.c.Get(ctx, &request{ActionID: actionID})
 			if err != nil {
 				t.Fatal(err)
-			}
-			if !tc.wantPut {
-				if !putTime.Equal(unknownPutTime) {
-					t.Errorf("put at %v, want %v", putTime, unknownPutTime)
-				}
-				return
 			}
 			if putTime.Before(before.Add(-time.Second)) || putTime.After(after) {
 				t.Errorf("put at %v, want between %v and %v", putTime, before, after)

@@ -232,6 +232,12 @@ func (o options) validate() error {
 	if o.deltaDir != "" && !o.readonly {
 		return errors.New("-delta-dir requires -readonly")
 	}
+	// -expire-others is for jobs that gate a merge or a release, which must
+	// never use a delta: it only makes the go command rerun tests, and builds
+	// would still use whatever the delta has, from whoever saved it.
+	if o.deltaDir != "" && o.expireOthers {
+		return errors.New("-delta-dir can't be used with -expire-others")
+	}
 	if o.deltaDir != "" && filepath.Clean(o.deltaDir) == filepath.Clean(o.cacheDir) {
 		return errors.New("-delta-dir must not be -dir")
 	}
@@ -499,7 +505,7 @@ func main() {
 	flag.DurationVar(&opts.refreshAfter, "refresh-after", 24*time.Hour, "rewrite objects older than this when using them, to restart their expiry (0 disables)")
 	flag.BoolVar(&opts.expireOthers, "expire-others", false, "report entries this process didn't put as put at the Unix epoch, so that after \"go clean -testcache\" the go command reruns every test result it didn't produce itself")
 	flag.StringVar(&opts.cacheDir, "dir", "", "local cache directory (default: <user cache dir>/.gocachebucket)")
-	flag.StringVar(&opts.deltaDir, "delta-dir", "", "keep this process's puts in this directory rather than -dir, and look there first; requires -readonly")
+	flag.StringVar(&opts.deltaDir, "delta-dir", "", "keep this process's puts in this directory rather than -dir, and look there first; requires -readonly, and can't be used with -expire-others")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "%s [flags] <bucket url>\n%s prune [flags]\n", os.Args[0], os.Args[0])

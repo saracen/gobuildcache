@@ -30,7 +30,7 @@ On GCS, gobuildcache authenticates with the credentials file named by `GOOGLE_AP
 - `-expire-others` to report every entry this process didn't put as put at the Unix epoch, so that after `go clean -testcache` the go command reruns every test result it didn't produce itself. See [rerunning cached tests](#rerunning-cached-tests).
 - `-stats` to log a summary of hits, misses and transfers when the process exits. With `-delta-dir`, `delta_hits` counts gets answered from the delta, `delta_puts` and `delta_put_bytes` what was added to it, and `delta_damaged` the outputs in it that didn't match their IDs.
 - `-dir` to specify the local cache directory (default `<user cache dir>/.gocachebucket`).
-- `-delta-dir` to keep what the process puts in this directory rather than `-dir`, and look there first. Requires `-readonly`. See [merge request deltas](#merge-request-deltas).
+- `-delta-dir` to keep what the process puts in this directory rather than `-dir`, and look there first. Requires `-readonly`, and can't be used with `-expire-others`. See [merge request deltas](#merge-request-deltas).
 - `-env` to remap an environment variable before opening the bucket, for example `-env GOOGLE_APPLICATION_CREDENTIALS=MY_CREDENTIALS_FILE`.
 
 ## getting cache hits in CI
@@ -51,7 +51,7 @@ A readonly job only gets from the bucket what trusted writers put there, so a me
 - Puts go to the delta dir, not `-dir`, and never to the bucket. Since the go command only puts what it missed, that's what the bucket didn't have. An entry the go command puts again unchanged, such as a test main on every `go list -test`, isn't added if the job already has it, unless `go clean -testcache` has expired its put time.
 - Gets look in the delta dir first, then `-dir`, then the bucket. What comes from the bucket is downloaded to `-dir`, never to the delta dir.
 - Go commands sharing a delta dir write to it as they do to `-dir`, through temporary files renamed into place, and wait on each other's claims (kept in `-dir`) the same way.
-- Put times, and so `go clean -testcache` and `-expire-others`, work as for `-dir`. A put time is the modification time of the entry's action link, so whatever saves and restores the delta dir must keep modification times, as GitLab's cache does.
+- Put times, and so `go clean -testcache`, work as for `-dir`. A put time is the modification time of the entry's action link, so whatever saves and restores the delta dir must keep modification times, as GitLab's cache does.
 - Each output is checked against its ID, a SHA-256 of its contents, before it's used, once per process. Restoring a CI cache can leave outputs damaged, such as truncated when extracting a file fails part way, and the go command uses most outputs as they are. A damaged output, or anything but a regular file in its place, is removed, so its entries are misses, and the go command computes them and puts them again.
 
 A delta is small: in gitlab-runner's integration test jobs, 1 to 14 MB, against 1 to 3 GB downloaded from the bucket.
@@ -66,16 +66,28 @@ gobuildcache prune -delta-dir <dir> -used-since <when the job started> [-max-siz
 - `-max-size` then removes the least recently used entries until their outputs take at most this size, in bytes or with a `KiB`, `MiB` or `GiB` suffix. It can also be used alone.
 - Run it after the job's go commands, and before the CI cache saves the delta dir. It only removes what gobuildcache writes there, including temporary files that killed processes left.
 
-A job trusts the delta as much as whatever wrote the CI cache it came from: in GitLab, any pipeline that can write the project's unprotected caches, whichever merge request it's for. Only give one to jobs whose results nothing depends on, such as merge request pipelines that don't gate a merge, and key it to the merge request and the job. Pipelines that gate a merge or a release should never use a delta.
+A job trusts the delta as much as whatever wrote the CI cache it came from: in GitLab, any pipeline that can write the project's unprotected caches, which includes any merge request's pipelines running its own CI configuration. Only give one to jobs whose results nothing depends on, such as merge request pipelines that don't gate a merge, and key it to the merge request and the job.
+
+Jobs that gate a merge or a release, merge trains included, must never use a delta, and must not even restore its CI cache: GitLab extracts a cache's whole archive over the checkout, whatever `paths` lists, so restoring one can replace the job's sources and scripts. gobuildcache refuses `-delta-dir` with `-expire-others`, which such jobs pass to rerun tests (see [rerunning cached tests](#rerunning-cached-tests)), so that a job wired to use both fails rather than trusting the delta.
 
 For example, in GitLab CI:
 
 ```yaml
 test:
   variables:
-    GOCACHEPROG: gobuildcache -readonly -delta-dir $CI_PROJECT_DIR/.gobuildcache/delta gs://bucket?anonymous=true
+    GOCACHEPROG: gobuildcache -readonly gs://bucket?anonymous=true
+    # Other pipelines never restore the delta, and have none to save.
+    DELTA_CACHE_POLICY: push
+  rules:
+    # merge request pipelines, but not merge trains, which gate merges
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      variables:
+        GOCACHEPROG: gobuildcache -readonly -delta-dir $CI_PROJECT_DIR/.gobuildcache/delta gs://bucket?anonymous=true
+        DELTA_CACHE_POLICY: pull-push
+    - when: on_success
   cache:
     key: gobuildcache-delta-$CI_MERGE_REQUEST_IID-$CI_JOB_NAME
+    policy: $DELTA_CACHE_POLICY
     paths: [.gobuildcache/delta/]
     when: always
   before_script:
@@ -93,7 +105,7 @@ test:
       fi
 ```
 
-GitLab saves the cache after `after_script`, which runs even when the job fails. Add `.gobuildcache/` to `.gitignore`: the go command stamps binaries built in a checkout with untracked files as modified.
+GitLab saves the cache after `after_script`, which runs even when the job fails, and doesn't save one with no files, as in pipelines without `-delta-dir`. Add `.gobuildcache/` to `.gitignore`: the go command stamps binaries built in a checkout with untracked files as modified.
 
 ## rerunning cached tests
 
