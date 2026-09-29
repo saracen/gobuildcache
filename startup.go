@@ -255,8 +255,11 @@ func traceAttempt(ctx context.Context) (context.Context, *attemptTrace) {
 // if nothing answered: it may well be moving bytes when time runs out. A
 // server that accepts connections and never reads is taken as reached too,
 // but the call made before each upload, a lookup of the output or a copy of
-// the entry, finds a bucket like that. A request without a body is sent at
-// once, so for other calls only an answer counts.
+// the entry, finds a bucket like that. An upload in flight when the bucket
+// goes away is found unreachable by its retry, which must then not be sent:
+// over HTTP/2, which would send it on the same connection, that needs the
+// dead connection closed (see gcsTransport). A request without a body is
+// sent at once, so for other calls only an answer counts.
 func (t *attemptTrace) reached(sending bool) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

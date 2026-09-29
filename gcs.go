@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"time"
 
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/gcsblob"
@@ -54,7 +55,7 @@ func (defaultOpener) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.Bucke
 type gcsOpener struct{}
 
 func (gcsOpener) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.Bucket, error) {
-	opener := &gcsblob.URLOpener{Client: gcp.NewAnonymousHTTPClient(gcp.DefaultTransport())}
+	opener := &gcsblob.URLOpener{Client: gcp.NewAnonymousHTTPClient(gcsTransport())}
 
 	// The emulator replaces the client with an unauthenticated one, and
 	// anonymous URLs don't use it, so neither needs credentials. Invalid
@@ -72,6 +73,38 @@ func (gcsOpener) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.Bucket, e
 	}
 
 	return opener.OpenBucketURL(ctx, u)
+}
+
+// gcsPingTimeout is how long a GCS connection can go without receiving
+// anything before it's pinged, and then how long the ping has to be answered
+// before the connection is closed. A ping can wait behind an upload's bytes
+// queued on a slow link, so this is generous, but it's well within an
+// attempt at a transfer.
+var gcsPingTimeout = 30 * time.Second
+
+// gcsTransport returns gcp.DefaultTransport, with HTTP/2 connections checked
+// with pings.
+//
+// The GCS client reaches the bucket over HTTP/2, which sends every request
+// to a host over one connection, and nothing else closes a connection that
+// stops answering: a request that runs out of time only resets its stream.
+// So when the bucket goes away during an upload, which counts as reaching
+// it once sent (see attemptTrace.reached), each retry would go out on the
+// same dead connection, be sent, and count as reaching the bucket too, and
+// the upload would take every attempt's timeout without turning the bucket
+// off. Once a ping goes unanswered, the connection is closed, and the retry
+// dials a new one, which can't reach the bucket. A connection that's
+// working, however slowly, receives the bucket's flow control updates as it
+// reads an upload, and its pings are answered.
+func gcsTransport() http.RoundTripper {
+	// http.DefaultTransport, which needn't be an *http.Transport
+	t, ok := gcp.DefaultTransport().(*http.Transport)
+	if !ok {
+		return gcp.DefaultTransport()
+	}
+	t = t.Clone()
+	t.HTTP2 = &http.HTTP2Config{SendPingTimeout: gcsPingTimeout, PingTimeout: gcsPingTimeout}
+	return t
 }
 
 // gcsAnonymous reports whether a gs:// URL's parameters ask for an
@@ -102,7 +135,7 @@ func gcsCredentialsClient(ctx context.Context, universeDomain string) (*gcp.HTTP
 	// nothing until the first call needs a token, which the startup check
 	// bounds; off GCE, that token request fails.
 	if !adcFromFile() {
-		client, err := gcp.NewHTTPClient(gcp.DefaultTransport(), google.ComputeTokenSource("", gcsScope))
+		client, err := gcp.NewHTTPClient(gcsTransport(), google.ComputeTokenSource("", gcsScope))
 		return client, universeDomain, err
 	}
 
@@ -115,7 +148,7 @@ func gcsCredentialsClient(ctx context.Context, universeDomain string) (*gcp.HTTP
 	creds, err := gcp.DefaultCredentialsWithParams(ctx, google.CredentialsParams{UniverseDomain: universeDomain})
 	if err != nil {
 		slog.Warn("no GCP credentials, the bucket can't be used", "err", err)
-		client, err := gcp.NewHTTPClient(gcp.DefaultTransport(), failingTokenSource{err})
+		client, err := gcp.NewHTTPClient(gcsTransport(), failingTokenSource{err})
 		return client, "", err
 	}
 
@@ -126,7 +159,7 @@ func gcsCredentialsClient(ctx context.Context, universeDomain string) (*gcp.HTTP
 		universeDomain = ""
 	}
 
-	client, err := gcp.NewHTTPClient(gcp.DefaultTransport(), creds.TokenSource)
+	client, err := gcp.NewHTTPClient(gcsTransport(), creds.TokenSource)
 	return client, universeDomain, err
 }
 

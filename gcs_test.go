@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +18,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"gocloud.dev/blob/gcsblob"
+	"gocloud.dev/gcp"
+	"google.golang.org/api/option"
 )
 
 // fakeGoogle answers token exchanges and object lookups for every request
@@ -359,5 +365,232 @@ func TestOpenBucket_GCSMetadataCredentials(t *testing.T) {
 	defer mu.Unlock()
 	if len(paths) != 1 {
 		t.Errorf("metadata requests = %q, want only the token", paths)
+	}
+}
+
+// freezer forwards connections to backend until frozen, then forwards
+// nothing more on them, and holds new ones without forwarding anything, as
+// a bucket that goes away behind a black hole does. It counts what it
+// accepts.
+type freezer struct {
+	net.Listener
+	frozen   atomic.Bool
+	accepted atomic.Int64
+}
+
+func newFreezer(t *testing.T, backend string) *freezer {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &freezer{Listener: l}
+
+	done := make(chan struct{})
+	var mu sync.Mutex
+	var held []net.Conn
+	hold := func(conn net.Conn) {
+		mu.Lock()
+		defer mu.Unlock()
+		held = append(held, conn)
+	}
+	pipe := func(dst, src net.Conn) {
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := src.Read(buf)
+			if f.frozen.Load() {
+				<-done
+				return
+			}
+			if _, werr := dst.Write(buf[:n]); werr != nil || err != nil {
+				return
+			}
+		}
+	}
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			f.accepted.Add(1)
+			hold(conn)
+			if f.frozen.Load() {
+				continue
+			}
+			upstream, err := net.Dial("tcp", backend)
+			if err != nil {
+				conn.Close()
+				continue
+			}
+			hold(upstream)
+			go pipe(conn, upstream)
+			go pipe(upstream, conn)
+		}
+	}()
+	t.Cleanup(func() {
+		close(done)
+		l.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range held {
+			conn.Close()
+		}
+	})
+	return f
+}
+
+// http2GCS serves gs://bucket over HTTP/2 with handler, which is also sent
+// the startup check, and returns the server, with its requests counted.
+func http2GCS(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+
+	var requests atomic.Int64
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 {
+			requests.Add(1)
+		}
+		handler(w, r)
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv, &requests
+}
+
+// openGCSAt opens gs://bucket at addr, served by srv, through gcsTransport,
+// checked at startup and sharing the result through dir.
+func openGCSAt(t *testing.T, srv *httptest.Server, addr, dir string) *Bucket {
+	t.Helper()
+
+	transport := gcsTransport().(*http.Transport)
+	transport.TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	t.Cleanup(transport.CloseIdleConnections)
+	underlying, err := gcsblob.OpenBucket(context.Background(), gcp.NewAnonymousHTTPClient(transport), "bucket", &gcsblob.Options{
+		ClientOptions: []option.ClientOption{option.WithEndpoint("https://" + addr + "/storage/v1/")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { underlying.Close() })
+	return checkedBucket(t, underlying, dir)
+}
+
+// quickPings makes gcsTransport's pings quick for a test.
+func quickPings(t *testing.T) {
+	t.Helper()
+	saved := gcsPingTimeout
+	t.Cleanup(func() { gcsPingTimeout = saved })
+	gcsPingTimeout = 50 * time.Millisecond
+}
+
+// gcsUploads calls upload for multipart uploads, and answers anything else
+// not found.
+func gcsUploads(upload http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("uploadType") == "multipart" {
+			upload(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"error":{"code":404,"message":"Not Found"}}`)
+	}
+}
+
+// writeOutput writes a 256KiB output to dir, sent in a single request, and
+// returns its ID.
+func writeOutput(t *testing.T, dir string) string {
+	t.Helper()
+	outputID := strings.Repeat("e", 64)
+	if err := os.WriteFile(filepath.Join(dir, outputDir, outputID), bytes.Repeat([]byte{'x'}, 256<<10), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return outputID
+}
+
+// Over HTTP/2, an upload's retry goes out on the connection the upload was
+// sent on, and a request that was sent counts as reaching the bucket. So if
+// the bucket goes away while the upload is sent, the connection must be
+// found dead for the retry to find the bucket unreachable.
+func TestGCSTransport_UploadToABucketThatGoesAwayTurnsItOff(t *testing.T) {
+	quickPings(t)
+
+	var f *freezer
+	var uploads atomic.Int64
+	srv, http2 := http2GCS(t, gcsUploads(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		f.frozen.Store(true)
+		io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	f = newFreezer(t, srv.Listener.Addr().String())
+
+	dir := t.TempDir()
+	b := openGCSAt(t, srv, f.Addr().String(), dir)
+	if !b.useRemote() {
+		t.Fatal("bucket turned off at startup")
+	}
+	fastRetries(t, 400*time.Millisecond)
+
+	if err := b.uploadOutput(context.Background(), writeOutput(t, dir)); err == nil {
+		t.Error("upload to a bucket that went away succeeded")
+	}
+	if http2.Load() == 0 {
+		t.Fatal("the bucket wasn't reached over HTTP/2")
+	}
+	if uploads.Load() == 0 {
+		t.Fatal("the upload wasn't sent")
+	}
+	if got := b.stats.Retries.Load(); got != 1 {
+		t.Errorf("retries = %d, want the retry to turn the bucket off", got)
+	}
+	if got := f.accepted.Load(); got < 2 {
+		t.Errorf("connections = %d, want the retry to dial a new one", got)
+	}
+	if b.remote.allow() {
+		t.Error("bucket still in use")
+	}
+	if reason, err := os.ReadFile(b.remote.marker); err != nil || len(reason) == 0 {
+		t.Errorf("marker: %q, %v; want the reason", reason, err)
+	}
+}
+
+// Pings mustn't take a slow upload's connection for a dead one.
+func TestGCSTransport_SlowUploadIsNotShared(t *testing.T) {
+	quickPings(t)
+	const timeout = 400 * time.Millisecond
+
+	var received, uploads atomic.Int64
+	srv, http2 := http2GCS(t, gcsUploads(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		readSlowly(r, &received, 2*timeout)
+	}))
+
+	dir := t.TempDir()
+	b := openGCSAt(t, srv, srv.Listener.Addr().String(), dir)
+	if !b.useRemote() {
+		t.Fatal("bucket turned off at startup")
+	}
+	fastRetries(t, timeout)
+
+	if err := b.uploadOutput(context.Background(), writeOutput(t, dir)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("upload = %v, want it to run out of time", err)
+	}
+	if http2.Load() == 0 {
+		t.Fatal("the bucket wasn't reached over HTTP/2")
+	}
+	if received.Load() == 0 {
+		t.Fatal("the upload wasn't sent")
+	}
+	if got := uploads.Load(); got != int64(maxAttempts) {
+		t.Errorf("uploads = %d, want it retried as an ordinary failure", got)
+	}
+	if !b.remote.allow() {
+		t.Error("bucket turned off by a slow upload")
+	}
+	if _, err := os.Stat(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("slow upload shared as unreachability: %v", err)
 	}
 }
