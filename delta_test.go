@@ -31,6 +31,7 @@ func newDeltaProcess(t *testing.T, dir, deltaDir string, underlying *blob.Bucket
 	if err != nil {
 		t.Fatal(err)
 	}
+	d.stats = &c.bucket.stats
 	c.delta = d
 
 	if maxWait > 0 {
@@ -281,6 +282,131 @@ func TestCacher_DeltaPutTimes(t *testing.T) {
 	}
 }
 
+// TestCacher_DeltaDamagedOutput checks that an output in a restored delta
+// that isn't a regular file matching its ID, as a failed CI cache extraction
+// can leave it, is a miss rather than used, that the go command putting it
+// again replaces it, whether or not it got it first, and that pruning
+// doesn't keep one that isn't put again.
+func TestCacher_DeltaDamagedOutput(t *testing.T) {
+	content := []byte("a compiled archive")
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		damage func(t *testing.T, pathname string)
+	}{
+		{name: "truncated", damage: func(t *testing.T, pathname string) {
+			if err := os.Truncate(pathname, int64(len(content)/2)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "empty", damage: func(t *testing.T, pathname string) {
+			if err := os.Truncate(pathname, 0); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "byte changed", damage: func(t *testing.T, pathname string) {
+			data := bytes.Clone(content)
+			data[3] ^= 0xff
+			if err := os.WriteFile(pathname, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "symlink", damage: func(t *testing.T, pathname string) {
+			if err := os.Remove(pathname); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, pathname); err != nil {
+				t.Skip("symlinks unavailable:", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actionID := bytes.Repeat([]byte{0xaa}, 32)
+			outputPath := func(deltaDir string) string {
+				return filepath.Join(deltaDir, outputDir, hashID(content))
+			}
+			damaged := func(t *testing.T) (string, *blob.Bucket) {
+				t.Helper()
+				underlying := memblob.OpenBucket(nil)
+				t.Cleanup(func() { underlying.Close() })
+				deltaDir := t.TempDir()
+				put(t, newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0), actionID, content)
+				tc.damage(t, outputPath(deltaDir))
+				return deltaDir, underlying
+			}
+			isGood := func(t *testing.T, deltaDir string) {
+				t.Helper()
+				fi, err := os.Lstat(outputPath(deltaDir))
+				if err != nil || !fi.Mode().IsRegular() {
+					t.Fatalf("output after putting it again: %v, %v", fi, err)
+				}
+				if data, err := os.ReadFile(outputPath(deltaDir)); err != nil || !bytes.Equal(data, content) {
+					t.Errorf("output after putting it again: %q, %v", data, err)
+				}
+			}
+
+			t.Run("get then put", func(t *testing.T) {
+				deltaDir, underlying := damaged(t)
+				c := newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0)
+				putUse := readUsed(deltaDir, hex.EncodeToString(actionID))
+				time.Sleep(10 * time.Millisecond)
+				if got := get(t, c, actionID); got != "" {
+					t.Fatalf("get = %q, want a miss", got)
+				}
+				if got := c.bucket.stats.DeltaDamaged.Load(); got != 1 {
+					t.Errorf("delta damaged = %d, want 1", got)
+				}
+				if got := readUsed(deltaDir, hex.EncodeToString(actionID)); !got.Equal(putUse) {
+					t.Errorf("miss on a damaged output recorded a use at %v", got)
+				}
+				put(t, c, actionID, content)
+				isGood(t, deltaDir)
+				if pathname := get(t, newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0), actionID); pathname != outputPath(deltaDir) {
+					t.Errorf("get after putting it again = %q, want the delta's", pathname)
+				}
+			})
+
+			t.Run("put without a get", func(t *testing.T) {
+				deltaDir, underlying := damaged(t)
+				c := newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0)
+				put(t, c, actionID, content)
+				isGood(t, deltaDir)
+				if got := c.bucket.stats.DeltaPuts.Load(); got != 1 {
+					t.Errorf("delta puts = %d, want 1", got)
+				}
+			})
+
+			t.Run("prune", func(t *testing.T) {
+				deltaDir, underlying := damaged(t)
+				start := time.Now()
+				time.Sleep(10 * time.Millisecond)
+				c := newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0)
+				// another entry is used, so the job used the delta
+				put(t, c, bytes.Repeat([]byte{0xbb}, 32), []byte("other"))
+				get(t, c, actionID)
+
+				result, err := pruneDelta(deltaDir, pruneOptions{usedSince: start})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Kept != 1 || deltaHas(t, deltaDir, actionID) {
+					t.Errorf("prune kept the damaged entry: %+v", result)
+				}
+				if _, err := os.Lstat(outputPath(deltaDir)); err == nil {
+					t.Error("prune kept the damaged output")
+				}
+				if data, err := os.ReadFile(outside); err != nil || !bytes.Equal(data, content) {
+					t.Errorf("file a symlinked output named changed: %q, %v", data, err)
+				}
+			})
+		})
+	}
+}
+
 // TestClaims_DeltaHit checks that a process waiting on another's claim gets
 // the entry it puts in the delta they share.
 func TestClaims_DeltaHit(t *testing.T) {
@@ -506,6 +632,19 @@ func TestPruneDelta_Leftovers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// a symlink under an output's name, which an entry links to
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("symlinked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	symlinked := writeDeltaEntry(t, dir, 3, "symlinked", now)
+	symlink := filepath.Join(outputDir, hashID([]byte("symlinked")))
+	if err := os.Remove(filepath.Join(dir, symlink)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, symlink)); err == nil {
+		leftovers = append(leftovers, symlink, filepath.Join(actionDir, symlinked))
+	}
 
 	result, err := pruneDelta(dir, pruneOptions{usedSince: now.Add(-time.Minute)})
 	if err != nil {
@@ -513,6 +652,9 @@ func TestPruneDelta_Leftovers(t *testing.T) {
 	}
 	if result.Kept != 1 {
 		t.Errorf("result %+v, want 1 kept", result)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("symlinked output's target removed: %v", err)
 	}
 	for _, name := range append(leftovers, filepath.Join(actionDir, broken), filepath.Join(usedDir, broken)) {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {

@@ -326,6 +326,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		if err != nil {
 			return err
 		}
+		delta.stats = &cacher.bucket.stats
 		cacher.delta = delta
 	}
 

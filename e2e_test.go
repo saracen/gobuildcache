@@ -812,3 +812,104 @@ func copyTree(t *testing.T, src, dst string) {
 		t.Fatal(err)
 	}
 }
+
+// TestEndToEnd_DeltaDamaged checks that a job whose restored delta has
+// damaged outputs, as a failed CI cache extraction leaves them, still builds
+// and tests, and puts correct outputs back in their place, so the next job
+// gets them from the delta. A truncated compiled archive otherwise crashes the
+// linker in every later pipeline of the merge request.
+func TestEndToEnd_DeltaDamaged(t *testing.T) {
+	tmp := t.TempDir()
+	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
+
+	mod := filepath.Join(tmp, "mod")
+	base := map[string]string{
+		"go.mod":          "module example.com/damaged\n\ngo 1.24\n",
+		"lib/lib.go":      "package lib\n\nfunc Add(a, b int) int { return a + b }\n",
+		"lib/lib_test.go": "package lib\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { t.Log(Add(1, 2)) }\n",
+		"app/app.go":      "package app\n\nimport \"example.com/damaged/lib\"\n\nfunc Three() int { return lib.Add(1, 2) }\n",
+		"app/app_test.go": "package app\n\nimport \"testing\"\n\nfunc TestThree(t *testing.T) { t.Log(Three()) }\n",
+	}
+	writeModule(t, mod, base)
+
+	goTest := func(name string, flags ...string) (string, map[string]int64) {
+		t.Helper()
+
+		cmd := exec.Command(goBin, "test", "./...")
+		cmd.Dir = mod
+		cmd.Env = jobEnv(tmp, name, bin, bucketURL, append([]string{"-stats"}, flags...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: go test: %v\n%s", name, err, out)
+		}
+		return string(out), parseStats(t, string(out))
+	}
+	goTest("writer")
+
+	writeModule(t, mod, map[string]string{
+		"lib/lib.go": "package lib\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Sub(a, b int) int { return a - b }\n",
+	})
+	delta1 := filepath.Join(tmp, "delta1")
+	goTest("mr1", "-readonly", "-delta-dir", delta1)
+	entries1, _ := deltaEntries(t, delta1)
+
+	// every output truncated or with a byte changed
+	delta2 := filepath.Join(tmp, "delta2")
+	copyTree(t, delta1, delta2)
+	outputs, err := os.ReadDir(filepath.Join(delta2, outputDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	damaged := 0
+	for i, e := range outputs {
+		p := filepath.Join(delta2, outputDir, e.Name())
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) == 0 {
+			continue
+		}
+		if i%2 == 0 {
+			data = data[:len(data)/2]
+		} else {
+			data[len(data)/2] ^= 0xff
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		damaged++
+	}
+	if damaged == 0 {
+		t.Fatal("no outputs to damage")
+	}
+
+	_, job2 := goTest("mr2", "-readonly", "-delta-dir", delta2)
+	if job2["delta_damaged"] == 0 || job2["delta_puts"] == 0 {
+		t.Errorf("job with a damaged delta: want damaged outputs found and put again: %v", job2)
+	}
+	outputs, err = os.ReadDir(filepath.Join(delta2, outputDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range outputs {
+		data, err := os.ReadFile(filepath.Join(delta2, outputDir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := hashID(data); got != e.Name() {
+			t.Errorf("output %s is still damaged after the job", e.Name())
+		}
+	}
+
+	// the next job gets everything it got from the first job's delta again
+	delta3 := filepath.Join(tmp, "delta3")
+	copyTree(t, delta2, delta3)
+	out, job3 := goTest("mr3", "-readonly", "-delta-dir", delta3)
+	if job3["delta_damaged"] != 0 || job3["delta_puts"] != 0 || job3["delta_hits"] == 0 || strings.Count(out, "(cached)") != 2 {
+		t.Errorf("job after the damaged one: want every test cached, from the delta and the bucket, and no puts: %v\n%s", job3, out)
+	}
+	if entries, _ := deltaEntries(t, delta3); !sameKeys(entries, entries1) {
+		t.Errorf("delta has %d entries after putting the damaged ones again, want the first job's %d", len(entries), len(entries1))
+	}
+}

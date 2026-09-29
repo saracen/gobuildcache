@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,14 +27,28 @@ import (
 // way, so go commands sharing it are as safe as ones sharing -dir. It also
 // records when each entry was last used, in used/, so that pruning can keep
 // only the entries the latest job used.
+//
+// Unlike -dir, it's restored by something else, which can leave an output
+// damaged: GitLab's cache extraction, for one, writes each file in place and
+// carries on after one fails part way. The go command only checks the size
+// of most outputs it gets, and uses their bytes as they are, so a truncated
+// compiled archive crashes the linker in every later job. So outputs are
+// checked against their IDs before they're used; see output.
 const usedDir = "used"
 
 type delta struct {
 	disk *Disk
 
+	// stats, if set, counts damaged outputs.
+	stats *Stats
+
 	// marked is the entries whose use this process has recorded; recording
 	// once per process is enough for pruning by the job's start.
 	marked sync.Map // actionID -> struct{}
+
+	// verified is the outputs this process has found to match their IDs, so
+	// each is hashed at most once per process.
+	verified sync.Map // outputID -> struct{}
 }
 
 func newDelta(dir string) (*delta, error) {
@@ -56,13 +72,72 @@ func (d *delta) hit(actionID string) (string, time.Time) {
 		return "", time.Time{}
 	}
 
-	pathname := filepath.Join(d.disk.cacheDir, outputDir, outputID)
-	if _, err := os.Stat(pathname); err != nil {
+	pathname, ok := d.output(outputID)
+	if !ok {
 		return "", time.Time{}
 	}
 
+	// only once the output is known to be good, so that pruning doesn't
+	// keep a damaged entry
 	d.markUsed(actionID)
 	return pathname, putTime
+}
+
+// output returns the path of outputID in the delta if it's a regular file
+// whose contents hash to outputID. One that doesn't match is removed, so that
+// its entries are misses the go command computes and puts again, and so that
+// it isn't saved again. Anything else there under an output's name, such as a
+// symlink a CI cache restored, is removed too: a put writes a regular file.
+func (d *delta) output(outputID string) (string, bool) {
+	pathname := filepath.Join(d.disk.cacheDir, outputDir, outputID)
+
+	fi, err := os.Lstat(pathname)
+	if err != nil {
+		return "", false
+	}
+	if !fi.Mode().IsRegular() {
+		d.damaged(pathname, fi, "not a regular file")
+		return "", false
+	}
+	if _, ok := d.verified.Load(outputID); ok {
+		return pathname, true
+	}
+
+	f, err := os.Open(pathname)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+
+	// what's hashed must be what was checked, and what's removed
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(fi, opened) {
+		return "", false
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		slog.Warn("reading delta output", "output", outputID, "err", err)
+		return "", false
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != outputID {
+		d.damaged(pathname, fi, "contents don't match its id")
+		return "", false
+	}
+
+	d.verified.Store(outputID, struct{}{})
+	return pathname, true
+}
+
+// damaged removes the damaged output at pathname, unless it has been replaced
+// since it was found, as by another process putting it again.
+func (d *delta) damaged(pathname string, found os.FileInfo, reason string) {
+	slog.Warn("removing damaged delta output", "path", pathname, "reason", reason)
+	if d.stats != nil {
+		d.stats.DeltaDamaged.Add(1)
+	}
+	if fi, err := os.Lstat(pathname); err == nil && os.SameFile(fi, found) {
+		os.Remove(pathname)
+	}
 }
 
 // markUsed records that actionID was used now, unless this process already
@@ -137,18 +212,26 @@ func linked(disk *Disk, actionID, outputID string, testExpire time.Time) (string
 // hold entries from the bucket, which later jobs get from there anyway.
 func (c *Cacher) putDelta(ctx context.Context, actionID, outputID string, body io.Reader) (string, error) {
 	testExpire := c.bucket.testExpire
-	if pathname, ok := linked(c.delta.disk, actionID, outputID, testExpire); ok {
-		c.delta.markUsed(actionID)
-		return pathname, nil
+	if _, ok := linked(c.delta.disk, actionID, outputID, testExpire); ok {
+		if pathname, ok := c.delta.output(outputID); ok {
+			c.delta.markUsed(actionID)
+			return pathname, nil
+		}
 	}
 	if pathname, ok := linked(c.disk, actionID, outputID, testExpire); ok {
 		return pathname, nil
 	}
 
 	pathname, err, _ := c.flight.Do("delta-put"+outputID, func() (any, error) {
+		// A damaged output is removed here, so this writes the go command's
+		// bytes in its place rather than keeping it.
+		if pathname, ok := c.delta.output(outputID); ok {
+			return pathname, nil
+		}
 		pathname, existed, err := c.delta.disk.PutOutput(ctx, outputID, body)
 		// outputs are content addressed, so only count the bytes once
 		if err == nil && !existed {
+			c.delta.verified.Store(outputID, struct{}{})
 			if fi, err := os.Stat(pathname); err == nil {
 				c.bucket.stats.DeltaPutBytes.Add(fi.Size())
 			}
@@ -193,7 +276,8 @@ type deltaEntry struct {
 // the delta, such as after a job's go commands and before the delta is saved.
 //
 // Only what gobuildcache writes there is removed: entries, their use
-// records, and temporary files left by processes that were killed.
+// records, temporary files left by processes that were killed, and symlinks
+// under an output's name, which gets remove anyway.
 func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 	var result pruneResult
 
@@ -233,8 +317,13 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 		if !isValidID(name) {
 			continue
 		}
-		if fi, err := os.Stat(filepath.Join(dir, outputDir, name)); err == nil && fi.Mode().IsRegular() {
+		// Anything else under an output's name isn't one, and gets are
+		// misses on it; see delta.output.
+		pathname := filepath.Join(dir, outputDir, name)
+		if fi, err := os.Lstat(pathname); err == nil && fi.Mode().IsRegular() {
 			sizes[name] = fi.Size()
+		} else if err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			os.Remove(pathname)
 		}
 	}
 

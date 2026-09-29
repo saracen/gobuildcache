@@ -28,7 +28,7 @@ On GCS, gobuildcache authenticates with the credentials file named by `GOOGLE_AP
 - `-dedupe-wait` to set how long to wait for another process sharing the local cache to put an action it's computing, rather than computing it too (default `1m`, `0` disables). See [concurrent go commands](#concurrent-go-commands).
 - `-refresh-after` to set how old an entry must be before a writer that uses it refreshes it (default `24h`, `0` disables). See [expiring old entries](#expiring-old-entries).
 - `-expire-others` to report every entry this process didn't put as put at the Unix epoch, so that after `go clean -testcache` the go command reruns every test result it didn't produce itself. See [rerunning cached tests](#rerunning-cached-tests).
-- `-stats` to log a summary of hits, misses and transfers when the process exits. With `-delta-dir`, `delta_hits` counts gets answered from the delta, and `delta_puts` and `delta_put_bytes` what was added to it.
+- `-stats` to log a summary of hits, misses and transfers when the process exits. With `-delta-dir`, `delta_hits` counts gets answered from the delta, `delta_puts` and `delta_put_bytes` what was added to it, and `delta_damaged` the outputs in it that didn't match their IDs.
 - `-dir` to specify the local cache directory (default `<user cache dir>/.gocachebucket`).
 - `-delta-dir` to keep what the process puts in this directory rather than `-dir`, and look there first. Requires `-readonly`. See [merge request deltas](#merge-request-deltas).
 - `-env` to remap an environment variable before opening the bucket, for example `-env GOOGLE_APPLICATION_CREDENTIALS=MY_CREDENTIALS_FILE`.
@@ -52,6 +52,7 @@ A readonly job only gets from the bucket what trusted writers put there, so a me
 - Gets look in the delta dir first, then `-dir`, then the bucket. What comes from the bucket is downloaded to `-dir`, never to the delta dir.
 - Go commands sharing a delta dir write to it as they do to `-dir`, through temporary files renamed into place, and wait on each other's claims (kept in `-dir`) the same way.
 - Put times, and so `go clean -testcache` and `-expire-others`, work as for `-dir`. A put time is the modification time of the entry's action link, so whatever saves and restores the delta dir must keep modification times, as GitLab's cache does.
+- Each output is checked against its ID, a SHA-256 of its contents, before it's used, once per process. Restoring a CI cache can leave outputs damaged, such as truncated when extracting a file fails part way, and the go command uses most outputs as they are. A damaged output, or anything but a regular file in its place, is removed, so its entries are misses, and the go command computes them and puts them again.
 
 A delta is small: in gitlab-runner's integration test jobs, 1 to 14 MB, against 1 to 3 GB downloaded from the bucket.
 
