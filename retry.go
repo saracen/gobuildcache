@@ -51,13 +51,13 @@ func retryable(err error) bool {
 // times. op must be safe to call again after a failure.
 //
 // An attempt that can't reach the bucket turns it off at once (see
-// unreachable), rather than being retried: SDKs that retry connection
-// errors already did so within the attempt, some until its timeout, so
-// every call in flight would otherwise take several timeouts to fail, and
-// the breaker several such calls to trip. Turning the bucket off also ends
-// the attempts still in flight. So does an attempt the SDK spent retrying
-// answers, such as 503s, until its timeout, for this process only (see
-// retriedAnswers).
+// unreachable and traceResponses), rather than being retried: SDKs that
+// retry connection errors already did so within the attempt, some until its
+// timeout, so every call in flight would otherwise take several timeouts to
+// fail, and the breaker several such calls to trip. Turning the bucket off
+// also ends the attempts still in flight. So does an attempt the SDK spent
+// retrying answers, such as 503s, until its timeout, for this process only
+// (see retriedAnswers).
 func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(context.Context) error) error {
 	delay := retryDelay
 
@@ -66,6 +66,7 @@ func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(c
 
 	for attempt := 1; ; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		attemptCtx, responded := traceResponses(attemptCtx)
 		stop := context.AfterFunc(b.remote.stopped(), cancel)
 		err := op(attemptCtx)
 		stop()
@@ -73,7 +74,7 @@ func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(c
 
 		if ctx.Err() == nil {
 			switch {
-			case unreachable(err):
+			case !responded() && unreachable(err):
 				b.remote.tripUnreachable(err)
 			case retriedAnswers(err):
 				b.remote.trip(err)

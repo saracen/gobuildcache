@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gocloud.dev/gcerrors"
@@ -106,8 +108,9 @@ func (b *Bucket) checkRemote() {
 		return
 	}
 
-	switch err := b.probe(); {
-	case unreachable(err):
+	ctx, responded := traceResponses(context.Background())
+	switch err := b.probe(ctx); {
+	case !responded() && unreachable(err):
 		b.remote.tripUnreachable(fmt.Errorf("checking bucket: %w", err))
 	case retriedAnswers(err):
 		b.remote.trip(fmt.Errorf("checking bucket: %w", err))
@@ -115,11 +118,11 @@ func (b *Bucket) checkRemote() {
 }
 
 // probe looks up probeKey, giving up after startupTimeout.
-func (b *Bucket) probe() error {
+func (b *Bucket) probe(ctx context.Context) error {
 	done := b.stats.remoteCall()
 	defer done()
 
-	ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
 
 	// Not every SDK call returns when its context ends: a GCS call waiting
@@ -153,6 +156,9 @@ func (b *Bucket) probe() error {
 // Errors that SDKs flatten into text, such as a failed token exchange,
 // aren't recognised either, and count towards the breaker as other errors
 // do. Nor is running out of time retrying answers (see retriedAnswers).
+//
+// A deadline doesn't show whether it came before or after an answer, so
+// callers also check that the call got no response (see traceResponses).
 func unreachable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || gcerrors.Code(err) == gcerrors.Canceled {
 		return false
@@ -174,6 +180,29 @@ func unreachable(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// traceResponses returns ctx with a trace noting when a response starts to
+// arrive for any HTTP request made with it, and a function that reports
+// whether one has.
+//
+// A call that got a response reached the bucket, whatever it failed with
+// after: a healthy transfer too slow to finish within transferTimeout ends
+// with the same deadline error as a call nothing answered, and taking it as
+// unreachability would turn the bucket off for every process sharing the
+// marker. The SDKs make their requests with the call's context, whichever
+// provider is behind the bucket. Token requests use the context the
+// credentials were created with, so a token service answering doesn't count,
+// and a token exchange that never answers still leaves the bucket
+// unreachable. An upload the GCS client sends in one request, one smaller
+// than its chunk size, is only answered once it's all sent, so one that runs
+// out of time still counts as unreachable.
+func traceResponses(ctx context.Context) (context.Context, func() bool) {
+	var responded atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotFirstResponseByte: func() { responded.Store(true) },
+	})
+	return ctx, responded.Load
 }
 
 // remoteDisabledMarker returns the path of the marker in dir for the bucket

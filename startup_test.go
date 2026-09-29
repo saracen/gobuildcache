@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -679,6 +680,194 @@ func TestBreaker_ServerErrorsPastTheAttemptTimeoutAreNotShared(t *testing.T) {
 	}
 	if _, err := os.Stat(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("server errors shared as unreachability: %v", err)
+	}
+}
+
+// emulatedGCS opens gs://bucket through the storage emulator, served by
+// handler, which answers the startup check not found, so that requests go
+// through a real HTTP transport, as they do in use. It returns the bucket,
+// checked at startup and sharing the result through dir.
+func emulatedGCS(t *testing.T, dir string, handler http.HandlerFunc) *Bucket {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, probeKey) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"error":{"code":404,"message":"Not Found"}}`)
+			return
+		}
+		handler(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("STORAGE_EMULATOR_HOST", srv.Listener.Addr().String())
+
+	underlying, err := openBucket(context.Background(), "gs://bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { underlying.Close() })
+	return checkedBucket(t, underlying, dir)
+}
+
+// trickle answers with a large body sent slowly, until the client goes
+// away, counting what it sends.
+func trickle(sent *atomic.Int64) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "1048576")
+		w.WriteHeader(http.StatusOK)
+		chunk := make([]byte, 1024)
+		for {
+			n, err := w.Write(chunk)
+			sent.Add(int64(n))
+			if err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	}
+}
+
+// A transfer the bucket answered but that's too slow to finish within an
+// attempt's timeout, such as a large output over a slow link, reached the
+// bucket, so it's an ordinary failure: it mustn't turn the bucket off for
+// the other processes sharing the marker.
+func TestBreaker_SlowDownloadIsNotShared(t *testing.T) {
+	fastRetries(t, 300*time.Millisecond)
+
+	var sent atomic.Int64
+	dir := t.TempDir()
+	b := emulatedGCS(t, dir, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/"+outputDir+"/") {
+			trickle(&sent)(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	if _, err := b.GetOutput(context.Background(), strings.Repeat("b", 64)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("download = %v, want it to run out of time", err)
+	}
+	if sent.Load() == 0 {
+		t.Fatal("the download got no answer")
+	}
+	if got := b.stats.Retries.Load(); got != int64(maxAttempts-1) {
+		t.Errorf("retries = %d, want it retried as an ordinary failure", got)
+	}
+	if got := b.remote.failures.Load(); got != 1 {
+		t.Errorf("failures = %d, want the download counted once", got)
+	}
+	if !b.remote.allow() {
+		t.Error("bucket turned off by a slow download")
+	}
+	if _, err := os.Stat(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("slow download shared as unreachability: %v", err)
+	}
+
+	// another process sharing the local cache still uses the bucket
+	var requests atomic.Int64
+	other := emulatedGCS(t, dir, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	})
+	if _, _, err := other.OutputIDFromAction(context.Background(), someAction); err != nil {
+		t.Error(err)
+	}
+	if !other.remote.allow() || requests.Load() == 0 {
+		t.Error("bucket turned off for another process")
+	}
+}
+
+// The same for an upload: a resumable upload, of an output larger than the
+// GCS client's chunk, is answered when it starts, before its chunks are sent.
+func TestBreaker_SlowUploadIsNotShared(t *testing.T) {
+	if testing.Short() {
+		t.Skip("uploads more than 16MiB")
+	}
+	const timeout = 300 * time.Millisecond
+	fastRetries(t, timeout)
+
+	var received atomic.Int64
+	dir := t.TempDir()
+	b := emulatedGCS(t, dir, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Query().Get("uploadType") == "resumable":
+			w.Header().Set("Location", "http://"+r.Host+"/upload/session")
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/upload/session":
+			// Reads can go on from buffers after the client gives up, so
+			// stop once it has.
+			start := time.Now()
+			buf := make([]byte, 1024)
+			for time.Since(start) < 2*timeout {
+				n, err := r.Body.Read(buf)
+				received.Add(int64(n))
+				if err != nil {
+					return
+				}
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(20 * time.Millisecond):
+				}
+			}
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"error":{"code":404,"message":"Not Found"}}`)
+		}
+	})
+
+	outputID := strings.Repeat("e", 64)
+	output := bytes.Repeat([]byte{'x'}, googleapi.DefaultUploadChunkSize+1)
+	if err := os.WriteFile(filepath.Join(dir, outputDir, outputID), output, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.uploadOutput(context.Background(), outputID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("upload = %v, want it to run out of time", err)
+	}
+	if received.Load() == 0 {
+		t.Fatal("the upload's chunk wasn't sent")
+	}
+	if !b.remote.allow() {
+		t.Error("bucket turned off by a slow upload")
+	}
+	if _, err := os.Stat(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("slow upload shared as unreachability: %v", err)
+	}
+}
+
+// A transfer that times out before any answer still can't reach the bucket,
+// over a real transport as with scriptedGCS.
+func TestBreaker_TransferWithoutAnAnswerIsShared(t *testing.T) {
+	fastRetries(t, 300*time.Millisecond)
+
+	b := emulatedGCS(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/"+outputDir+"/") {
+			<-r.Context().Done()
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	if _, err := b.GetOutput(context.Background(), strings.Repeat("b", 64)); err == nil {
+		t.Error("download nothing answered succeeded")
+	}
+	if got := b.stats.Retries.Load(); got != 0 {
+		t.Errorf("retries = %d, want the first attempt to turn the bucket off", got)
+	}
+	if b.remote.allow() {
+		t.Error("bucket still in use")
+	}
+	if reason, err := os.ReadFile(b.remote.marker); err != nil || len(reason) == 0 {
+		t.Errorf("marker: %q, %v; want the reason", reason, err)
 	}
 }
 
