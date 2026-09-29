@@ -62,7 +62,7 @@ The delta should stay the merge request's working set, not grow with every chang
 gobuildcache prune -delta-dir <dir> -used-since <when the job started> [-max-size <size>]
 ```
 
-- `-used-since` takes Unix seconds, as `date +%s` prints, or an RFC 3339 time. Take it on the machine running the job, before its first go command: when an entry was used is by that machine's clock.
+- `-used-since` takes Unix seconds, as `date +%s` prints, or an RFC 3339 time. Take it on the machine running the job, before its first go command: when an entry was used is by that machine's clock. If no entry was used since, as when the job failed before its go commands ran, prune says so and only applies `-max-size`, so that a retry still has the delta.
 - `-max-size` then removes the least recently used entries until their outputs take at most this size, in bytes or with a `KiB`, `MiB` or `GiB` suffix. It can also be used alone.
 - Run it after the job's go commands, and before the CI cache saves the delta dir. It only removes what gobuildcache writes there, including temporary files that killed processes left.
 
@@ -83,7 +83,14 @@ test:
   script:
     - go test ./...
   after_script:
-    - gobuildcache prune -delta-dir .gobuildcache/delta -used-since "$(cat .gobuildcache/started)" -max-size 256MiB
+    # A job that failed may not have used everything it needs from the
+    # delta, such as the tests it didn't get to, so keep those.
+    - |
+      if [ "$CI_JOB_STATUS" = success ]; then
+        gobuildcache prune -delta-dir .gobuildcache/delta -used-since "$(cat .gobuildcache/started)" -max-size 256MiB
+      else
+        gobuildcache prune -delta-dir .gobuildcache/delta -max-size 256MiB
+      fi
 ```
 
 GitLab saves the cache after `after_script`, which runs even when the job fails. Add `.gobuildcache/` to `.gitignore`: the go command stamps binaries built in a checkout with untracked files as modified.

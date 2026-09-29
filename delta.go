@@ -252,7 +252,8 @@ func (c *Cacher) putDelta(ctx context.Context, actionID, outputID string, body i
 }
 
 type pruneOptions struct {
-	// usedSince removes entries last used before it, unless zero.
+	// usedSince removes entries last used before it, unless zero or no
+	// entry was used since.
 	usedSince time.Time
 
 	// maxSize removes the least recently used entries until their outputs
@@ -263,6 +264,10 @@ type pruneOptions struct {
 type pruneResult struct {
 	Kept, Removed           int
 	KeptBytes, RemovedBytes int64
+
+	// Unused is set when no entry was used since usedSince, which was then
+	// ignored.
+	Unused bool
 }
 
 type deltaEntry struct {
@@ -274,6 +279,10 @@ type deltaEntry struct {
 // pruneDelta removes the entries in the delta dir that opts don't keep, and
 // the outputs no kept entry links to. It must run when no go command is using
 // the delta, such as after a job's go commands and before the delta is saved.
+//
+// If no entry was used since usedSince, it only applies maxSize: a job that
+// fails before its go commands run, such as while setting up, uses nothing,
+// and removing everything would leave its retry nothing to use.
 //
 // Only what gobuildcache writes there is removed: entries, their use
 // records, temporary files left by processes that were killed, and symlinks
@@ -327,6 +336,14 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 		}
 	}
 
+	usedSince := opts.usedSince
+	if !usedSince.IsZero() && len(entries) > 0 && !slices.ContainsFunc(entries, func(e deltaEntry) bool {
+		return !e.used.Before(usedSince)
+	}) {
+		usedSince = time.Time{}
+		result.Unused = true
+	}
+
 	// most recently used first, so the size cap removes the least
 	sortEntries(entries)
 
@@ -335,7 +352,7 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 	full := false
 	for _, e := range entries {
 		size, ok := sizes[e.outputID]
-		keep := ok && (opts.usedSince.IsZero() || !e.used.Before(opts.usedSince))
+		keep := ok && (usedSince.IsZero() || !e.used.Before(usedSince))
 		if _, counted := kept[e.outputID]; counted {
 			size = 0
 		}

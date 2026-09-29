@@ -564,7 +564,7 @@ func main() {
 func pruneMain(args []string) int {
 	flags := flag.NewFlagSet("prune", flag.ContinueOnError)
 	deltaDir := flags.String("delta-dir", "", "the delta directory to prune")
-	usedSince := flags.String("used-since", "", "remove entries not used since this time, in Unix seconds or RFC 3339, such as when the job started")
+	usedSince := flags.String("used-since", "", "remove entries not used since this time, in Unix seconds or RFC 3339, such as when the job started, unless none was")
 	maxSize := flags.String("max-size", "", "remove the least recently used entries, after -used-since, until their outputs take at most this size, in bytes or with a KiB, MiB or GiB suffix")
 	verbose := flags.Bool("v", false, "verbose")
 	flags.Usage = func() {
@@ -604,6 +604,9 @@ func pruneMain(args []string) int {
 	if err != nil {
 		slog.Error("prune", "err", err)
 		return 1
+	}
+	if result.Unused {
+		slog.Warn("gobuildcache prune: no entry was used since -used-since, so the job's go commands didn't use the delta; only -max-size applied")
 	}
 	slog.Info("gobuildcache prune", "kept", result.Kept, "kept_bytes", result.KeptBytes, "removed", result.Removed, "removed_bytes", result.RemovedBytes)
 	return 0

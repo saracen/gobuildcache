@@ -518,6 +518,7 @@ func TestPruneDelta(t *testing.T) {
 		opts    pruneOptions
 		want    []int // indexes of the entries kept
 		kept    int64
+		unused  bool
 	}{
 		{
 			name:    "used since",
@@ -554,6 +555,23 @@ func TestPruneDelta(t *testing.T) {
 			want:    []int{1},
 			kept:    4,
 		},
+		{
+			// a job that failed before its go commands ran
+			name:    "nothing used since",
+			entries: []entry{{"aaaa", earlier}, {"bbbb", earlier.Add(-time.Second)}, {"never recorded", time.Time{}}},
+			opts:    pruneOptions{usedSince: jobStart},
+			want:    []int{0, 1, 2},
+			kept:    int64(len("aaaa") + len("bbbb") + len("never recorded")),
+			unused:  true,
+		},
+		{
+			name:    "nothing used since, with a size cap",
+			entries: []entry{{"aaaa", earlier}, {"bbbb", earlier.Add(-time.Second)}, {"cc", time.Time{}}},
+			opts:    pruneOptions{usedSince: jobStart, maxSize: 5},
+			want:    []int{0},
+			kept:    4,
+			unused:  true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -566,8 +584,8 @@ func TestPruneDelta(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if result.Kept != len(tc.want) || result.Removed != len(tc.entries)-len(tc.want) || result.KeptBytes != tc.kept {
-				t.Errorf("result %+v, want %d kept, %d bytes", result, len(tc.want), tc.kept)
+			if result.Kept != len(tc.want) || result.Removed != len(tc.entries)-len(tc.want) || result.KeptBytes != tc.kept || result.Unused != tc.unused {
+				t.Errorf("result %+v, want %d kept, %d bytes, unused %v", result, len(tc.want), tc.kept, tc.unused)
 			}
 
 			keep := map[int]bool{}

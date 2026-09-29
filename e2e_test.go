@@ -619,6 +619,19 @@ func TestEndToEnd_Delta(t *testing.T) {
 		t.Errorf("first job's delta has %d entries, want the %d that a readonly job without one puts in -dir (%v)", len(entries1), len(want), control)
 	}
 
+	// A retry that fails before its go commands run, such as while setting
+	// up, uses nothing, and pruning keeps the delta for the next retry.
+	failed := filepath.Join(tmp, "failed")
+	copyTree(t, delta1, failed)
+	failedStart := time.Now()
+	prune := exec.Command(bin, "prune", "-delta-dir", failed, "-used-since", failedStart.Format(time.RFC3339Nano))
+	if out, err := prune.CombinedOutput(); err != nil || !strings.Contains(string(out), "didn't use the delta") {
+		t.Errorf("prune after a job that ran no go commands: %v\n%s", err, out)
+	}
+	if entries, size := deltaEntries(t, failed); !sameKeys(entries, entries1) || size != bytes1 {
+		t.Errorf("prune after a job that ran no go commands kept %d of %d entries, %d of %d bytes", len(entries), len(entries1), size, bytes1)
+	}
+
 	// The next pipeline restores the delta. Its lib and app entries hit the
 	// delta, and the reverted extra and everything else hit the bucket, so
 	// it puts nothing.
@@ -642,7 +655,7 @@ func TestEndToEnd_Delta(t *testing.T) {
 	// Pruning removes the entries the second job didn't use: extra's, and
 	// some of lib's, since the go command stores a test result it ran under
 	// two keys, and later jobs only look up the first.
-	prune := exec.Command(bin, "prune", "-delta-dir", delta2, "-used-since", started.Format(time.RFC3339Nano))
+	prune = exec.Command(bin, "prune", "-delta-dir", delta2, "-used-since", started.Format(time.RFC3339Nano))
 	if out, err := prune.CombinedOutput(); err != nil {
 		t.Fatalf("prune: %v\n%s", err, out)
 	}
