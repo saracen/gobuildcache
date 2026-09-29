@@ -63,12 +63,15 @@ type Stats struct {
 
 	// DeltaHits counts gets answered from the delta dir, DeltaPuts the puts
 	// stored there, and DeltaPutBytes the size of the outputs they added.
-	// DeltaDamaged counts outputs there that didn't match their IDs, which
-	// were removed.
+	// DeltaDamaged counts outputs there that didn't match their IDs or
+	// couldn't be read, which were removed. DeltaErrors counts other reads
+	// and writes of it that failed, whose entries were then missing or put
+	// in -dir, and a delta that isn't writable at all counts once.
 	DeltaHits     atomic.Int64
 	DeltaPuts     atomic.Int64
 	DeltaPutBytes atomic.Int64
 	DeltaDamaged  atomic.Int64
+	DeltaErrors   atomic.Int64
 
 	// Started is when the process started, for its running time.
 	Started time.Time
@@ -113,6 +116,7 @@ func (s *Stats) Log() {
 		"delta_puts", s.DeltaPuts.Load(),
 		"delta_put_bytes", s.DeltaPutBytes.Load(),
 		"delta_damaged", s.DeltaDamaged.Load(),
+		"delta_errors", s.DeltaErrors.Load(),
 	)
 }
 

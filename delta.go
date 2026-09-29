@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,13 +35,29 @@ import (
 // of most outputs it gets, and uses their bytes as they are, so a truncated
 // compiled archive crashes the linker in every later job. So outputs are
 // checked against their IDs before they're used; see output.
+//
+// It can also belong to another user, as when a CI cache restores it with
+// the owner it was saved with for a job running as someone else. What the
+// job can't read is missing, and what it can't write is kept in -dir, so
+// that such a delta costs its benefit rather than failing the go command.
+// Files are created with the go command's modes, less the umask, so that
+// where a CI system relies on the umask to share caches across users, it
+// works for the delta too; see createTemp.
 const usedDir = "used"
 
 type delta struct {
 	disk *Disk
 
-	// stats, if set, counts damaged outputs.
+	// stats, if set, counts damaged outputs and failed reads and writes.
 	stats *Stats
+
+	// writable is whether puts and use records can be written; if not,
+	// puts are kept in -dir and uses aren't recorded.
+	writable bool
+
+	// warned is set once a failed read or write has been logged as a
+	// warning; see problem.
+	warned atomic.Bool
 
 	// marked is the entries whose use this process has recorded; recording
 	// once per process is enough for pruning by the job's start.
@@ -51,13 +68,44 @@ type delta struct {
 	verified sync.Map // outputID -> struct{}
 }
 
+// newDelta returns the delta in dir, creating it if needed. A delta this
+// process can't write to is still read, as its outputs are checked, but
+// isn't changed.
 func newDelta(dir string) (*delta, error) {
 	for _, sub := range []string{actionDir, outputDir, usedDir} {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o777); err != nil {
 			return nil, fmt.Errorf("creating delta %s dir: %w", sub, err)
 		}
 	}
-	return &delta{disk: &Disk{cacheDir: dir}}, nil
+	d := &delta{disk: &Disk{cacheDir: dir}, writable: true}
+
+	// puts write temporary files in the delta dir itself, then rename them
+	// into action/ and output/
+	for _, sub := range []string{"", actionDir, outputDir, usedDir} {
+		f, err := createTemp(filepath.Join(dir, sub), ".writable")
+		if err != nil {
+			slog.Warn("delta dir isn't writable, so it's only read, and puts are kept in -dir", "err", err)
+			d.writable = false
+			break
+		}
+		f.Close()
+		os.Remove(f.Name())
+	}
+	return d, nil
+}
+
+// problem logs a failed read or write of the delta, after which the entry
+// is treated as missing: the first as a warning, and the rest, which usually
+// fail for the same reason, at debug level.
+func (d *delta) problem(msg string, args ...any) {
+	if d.stats != nil {
+		d.stats.DeltaErrors.Add(1)
+	}
+	if d.warned.CompareAndSwap(false, true) {
+		slog.Warn(msg+", so the entry is treated as missing from the delta; further delta errors are logged at debug level", args...)
+		return
+	}
+	slog.Debug(msg, args...)
 }
 
 // hit returns the path of actionID's output and when it was put if the delta
@@ -65,7 +113,7 @@ func newDelta(dir string) (*delta, error) {
 func (d *delta) hit(actionID string) (string, time.Time) {
 	outputID, putTime, err := d.disk.OutputIDFromAction(context.Background(), actionID)
 	if err != nil {
-		slog.Warn("delta lookup", "action", actionID, "err", err)
+		d.problem("delta lookup failed", "action", actionID, "err", err)
 		return "", time.Time{}
 	}
 	if outputID == "" {
@@ -84,10 +132,11 @@ func (d *delta) hit(actionID string) (string, time.Time) {
 }
 
 // output returns the path of outputID in the delta if it's a regular file
-// whose contents hash to outputID. One that doesn't match is removed, so that
-// its entries are misses the go command computes and puts again, and so that
-// it isn't saved again. Anything else there under an output's name, such as a
-// symlink a CI cache restored, is removed too: a put writes a regular file.
+// whose contents hash to outputID. One that doesn't match or can't be read is
+// removed, so that its entries are misses the go command computes and puts
+// again, and so that it isn't saved again. Anything else there under an
+// output's name, such as a symlink a CI cache restored, is removed too: a put
+// writes a regular file.
 func (d *delta) output(outputID string) (string, bool) {
 	pathname := filepath.Join(d.disk.cacheDir, outputDir, outputID)
 
@@ -104,7 +153,11 @@ func (d *delta) output(outputID string) (string, bool) {
 	}
 
 	f, err := os.Open(pathname)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false
+	}
 	if err != nil {
+		d.damaged(pathname, fi, "can't be read: "+err.Error())
 		return "", false
 	}
 	defer f.Close()
@@ -116,7 +169,7 @@ func (d *delta) output(outputID string) (string, bool) {
 	}
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		slog.Warn("reading delta output", "output", outputID, "err", err)
+		d.problem("reading delta output failed", "output", outputID, "err", err)
 		return "", false
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != outputID {
@@ -141,9 +194,12 @@ func (d *delta) damaged(pathname string, found os.FileInfo, reason string) {
 }
 
 // markUsed records that actionID was used now, unless this process already
-// has. The time is the record's contents, not its modification time, so it
-// doesn't matter whether whatever saves the delta keeps those.
+// has or can't. The time is the record's contents, not its modification
+// time, so it doesn't matter whether whatever saves the delta keeps those.
 func (d *delta) markUsed(actionID string) {
+	if !d.writable {
+		return
+	}
 	if _, loaded := d.marked.LoadOrStore(actionID, struct{}{}); loaded {
 		return
 	}
@@ -151,14 +207,14 @@ func (d *delta) markUsed(actionID string) {
 	now := strconv.FormatInt(time.Now().UnixNano(), 10)
 	if err := writeFileAtomic(filepath.Join(d.disk.cacheDir, usedDir), actionID, now); err != nil {
 		d.marked.Delete(actionID)
-		slog.Warn("recording delta entry use", "action", actionID, "err", err)
+		d.problem("recording delta entry use failed", "action", actionID, "err", err)
 	}
 }
 
 // writeFileAtomic writes name in dir by renaming a temporary file into
 // place, so readers never see it partly written.
 func writeFileAtomic(dir, name, data string) error {
-	f, err := os.CreateTemp(dir, name+".tmp.*")
+	f, err := createTemp(dir, name+".tmp.")
 	if err != nil {
 		return err
 	}
@@ -202,7 +258,8 @@ func linked(disk *Disk, actionID, outputID string, testExpire time.Time) (string
 	return pathname, true
 }
 
-// putDelta stores a put in the delta, returning the path of its output.
+// putDelta stores a put in the delta, returning the path of its output. An
+// error means the delta can't take it, and the put belongs in -dir instead.
 //
 // The go command puts some entries again unchanged every time it uses them,
 // such as a test package's generated test main on every "go list -test". An
@@ -229,6 +286,13 @@ func (c *Cacher) putDelta(ctx context.Context, actionID, outputID string, body i
 			return pathname, nil
 		}
 		pathname, existed, err := c.delta.disk.PutOutput(ctx, outputID, body)
+		// Either another process put it since, or output couldn't use or
+		// remove what's there, and it can't be given to the go command.
+		if err == nil && existed {
+			if _, ok := c.delta.output(outputID); !ok {
+				return "", fmt.Errorf("delta output %s can't be used or replaced", outputID)
+			}
+		}
 		// outputs are content addressed, so only count the bytes once
 		if err == nil && !existed {
 			c.delta.verified.Store(outputID, struct{}{})
@@ -268,6 +332,11 @@ type pruneResult struct {
 	// Unused is set when no entry was used since usedSince, which was then
 	// ignored.
 	Unused bool
+
+	// Failed counts the files that should have been removed but couldn't
+	// be, such as another user's, and Err is the first such error.
+	Failed int
+	Err    error
 }
 
 type deltaEntry struct {
@@ -286,9 +355,26 @@ type deltaEntry struct {
 //
 // Only what gobuildcache writes there is removed: entries, their use
 // records, temporary files left by processes that were killed, and symlinks
-// under an output's name, which gets remove anyway.
+// under an output's name, which gets remove anyway. What can't be removed is
+// counted, rather than stopping it, as a job can still use the rest.
 func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 	var result pruneResult
+	remove := func(pathname string) bool {
+		err := os.Remove(pathname)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+		result.Failed++
+		if result.Err == nil {
+			result.Err = err
+		}
+		return false
+	}
+	removeEntry := func(actionID string) bool {
+		ok := remove(filepath.Join(dir, actionDir, actionID))
+		remove(filepath.Join(dir, usedDir, actionID))
+		return ok
+	}
 
 	names, err := readDirNames(filepath.Join(dir, actionDir))
 	if errors.Is(err, os.ErrNotExist) {
@@ -302,7 +388,7 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 	for _, name := range names {
 		pathname := filepath.Join(dir, actionDir, name)
 		if isTempName(name) {
-			os.Remove(pathname)
+			remove(pathname)
 			continue
 		}
 		if !isValidID(name) {
@@ -311,7 +397,9 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 
 		outputID, _, err := readActionLink(pathname)
 		if err != nil || !isValidID(outputID) {
-			removeEntry(dir, name)
+			if removeEntry(name) {
+				result.Removed++
+			}
 			continue
 		}
 		entries = append(entries, deltaEntry{actionID: name, outputID: outputID, used: readUsed(dir, name)})
@@ -332,7 +420,7 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 		if fi, err := os.Lstat(pathname); err == nil && fi.Mode().IsRegular() {
 			sizes[name] = fi.Size()
 		} else if err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			os.Remove(pathname)
+			remove(pathname)
 		}
 	}
 
@@ -362,8 +450,9 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 		}
 
 		if !keep {
-			removeEntry(dir, e.actionID)
-			result.Removed++
+			if removeEntry(e.actionID) {
+				result.Removed++
+			}
 			continue
 		}
 		kept[e.outputID] = struct{}{}
@@ -376,7 +465,7 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 		if _, ok := kept[outputID]; ok {
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, outputDir, outputID)); err == nil {
+		if remove(filepath.Join(dir, outputDir, outputID)) {
 			result.RemovedBytes += size
 		}
 	}
@@ -388,14 +477,14 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 	}
 	for _, name := range used {
 		if isTempName(name) {
-			os.Remove(filepath.Join(dir, usedDir, name))
+			remove(filepath.Join(dir, usedDir, name))
 			continue
 		}
 		if !isValidID(name) {
 			continue
 		}
 		if _, err := os.Lstat(filepath.Join(dir, actionDir, name)); errors.Is(err, os.ErrNotExist) {
-			os.Remove(filepath.Join(dir, usedDir, name))
+			remove(filepath.Join(dir, usedDir, name))
 		}
 	}
 
@@ -406,16 +495,11 @@ func pruneDelta(dir string, opts pruneOptions) (pruneResult, error) {
 	}
 	for _, name := range root {
 		if isOutputTempName(name) {
-			os.Remove(filepath.Join(dir, name))
+			remove(filepath.Join(dir, name))
 		}
 	}
 
 	return result, nil
-}
-
-func removeEntry(dir, actionID string) {
-	os.Remove(filepath.Join(dir, actionDir, actionID))
-	os.Remove(filepath.Join(dir, usedDir, actionID))
 }
 
 func sortEntries(entries []deltaEntry) {

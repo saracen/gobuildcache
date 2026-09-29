@@ -170,15 +170,31 @@ func (c *Cacher) Put(ctx context.Context, req *request) (string, error) {
 
 	slog.Debug("put", "action", actionID, "output", outputID)
 
-	if c.delta != nil {
+	if c.delta != nil && c.delta.writable {
 		pathname, err := c.putDelta(ctx, actionID, outputID, req.Body)
 		if err == nil {
 			c.puts.Store(actionID, outputID)
+			if c.claims != nil {
+				c.claims.release(actionID)
+			}
+			return pathname, nil
 		}
-		if c.claims != nil {
-			c.claims.release(actionID)
+
+		// What the delta can't take is kept in -dir, as without one, so
+		// that a delta this process can't write to doesn't fail the go
+		// command's build.
+		c.delta.problem("delta put failed", "action", actionID, "err", err)
+		rewound := false
+		if body, ok := req.Body.(io.Seeker); ok {
+			_, serr := body.Seek(0, io.SeekStart)
+			rewound = serr == nil
 		}
-		return pathname, err
+		if !rewound {
+			if c.claims != nil {
+				c.claims.release(actionID)
+			}
+			return "", err
+		}
 	}
 
 	pathname, err, shared := c.flight.Do("put"+outputID, func() (any, error) {
@@ -320,20 +336,27 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		}
 	}()
 
-	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, actionDir), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, actionDir), 0o777); err != nil {
 		return fmt.Errorf("creating cache action dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, outputDir), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(cacher.disk.cacheDir, outputDir), 0o777); err != nil {
 		return fmt.Errorf("creating cache output dir: %w", err)
 	}
 
+	// A delta that can't be used is as good as missing: it only saves
+	// recomputing what it has.
 	if opts.deltaDir != "" {
 		delta, err := newDelta(opts.deltaDir)
 		if err != nil {
-			return err
+			slog.Warn("not using the delta dir", "err", err)
+			cacher.bucket.stats.DeltaErrors.Add(1)
+		} else {
+			if !delta.writable {
+				cacher.bucket.stats.DeltaErrors.Add(1)
+			}
+			delta.stats = &cacher.bucket.stats
+			cacher.delta = delta
 		}
-		delta.stats = &cacher.bucket.stats
-		cacher.delta = delta
 	}
 
 	if opts.dedupeWait > 0 {
@@ -613,6 +636,9 @@ func pruneMain(args []string) int {
 	}
 	if result.Unused {
 		slog.Warn("gobuildcache prune: no entry was used since -used-since, so the job's go commands didn't use the delta; only -max-size applied")
+	}
+	if result.Failed > 0 {
+		slog.Warn("gobuildcache prune: couldn't remove some of the delta's files, such as ones another user owns, so they stay in it when it's saved", "failed", result.Failed, "err", result.Err)
 	}
 	slog.Info("gobuildcache prune", "kept", result.Kept, "kept_bytes", result.KeptBytes, "removed", result.Removed, "removed_bytes", result.RemovedBytes)
 	return 0

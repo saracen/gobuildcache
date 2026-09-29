@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -718,6 +719,123 @@ func TestDelta_UseRecordedOncePerProcess(t *testing.T) {
 	get(t, c, actionID)
 	if again := readUsed(deltaDir, id); !again.Equal(hit) {
 		t.Errorf("second hit recorded its use again, at %v", again)
+	}
+}
+
+// TestServe_DeltaUncreatable checks that a delta dir that can't be created
+// is as good as missing, rather than failing every go command.
+func TestServe_DeltaUncreatable(t *testing.T) {
+	underlying := memblob.OpenBucket(nil)
+	defer underlying.Close()
+
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := options{cacheDir: t.TempDir(), readonly: true, deltaDir: filepath.Join(file, "delta")}
+	var out bytes.Buffer
+	if err := serve(context.Background(), underlying, opts, strings.NewReader(`{"ID":1,"Command":"close"}`+"\n"), &out); err != nil {
+		t.Errorf("serve with a delta dir that can't be created: %v", err)
+	}
+	if !strings.Contains(out.String(), `"ID":1`) {
+		t.Errorf("no answer to close: %q", out.String())
+	}
+}
+
+// TestCacher_DeltaUnwritable checks that puts a delta can't take are kept in
+// -dir, whether it couldn't be written from the start or stopped being
+// writable later, and that an output there that can't be read or replaced
+// isn't given to the go command.
+func TestCacher_DeltaUnwritable(t *testing.T) {
+	skipUnlessPermissionsApply(t)
+
+	actionID, content := bytes.Repeat([]byte{0xaa}, 32), []byte("computed")
+	other, otherContent := bytes.Repeat([]byte{0xbb}, 32), []byte("computed again")
+	for _, tc := range []struct {
+		name string
+		// before is whether the delta is made unwritable before the
+		// process starts
+		before bool
+		// what the delta's files and directories are changed to
+		file, dir os.FileMode
+	}{
+		{name: "from the start", before: true, file: 0o444, dir: 0o555},
+		{name: "from the start, unreadable", before: true, file: 0, dir: 0o555},
+		{name: "after starting", file: 0o444, dir: 0o555},
+		{name: "after starting, unreadable", file: 0, dir: 0o555},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			underlying := memblob.OpenBucket(nil)
+			t.Cleanup(func() { underlying.Close() })
+			deltaDir := t.TempDir()
+			put(t, newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0), actionID, content)
+			before := snapshotTree(t, deltaDir)
+
+			var c *Cacher
+			if tc.before {
+				chmodTree(t, deltaDir, tc.file, tc.dir)
+				c = newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0)
+			} else {
+				c = newDeltaProcess(t, t.TempDir(), deltaDir, underlying, 0)
+				chmodTree(t, deltaDir, tc.file, tc.dir)
+			}
+			if got := c.delta.writable; got != !tc.before {
+				t.Errorf("writable = %v, want %v", got, !tc.before)
+			}
+
+			readable := tc.file&0o400 != 0
+			if got := get(t, c, actionID); (got != "") != readable {
+				t.Errorf("get of an entry the delta has = %q, want a hit only if it can be read", got)
+			}
+
+			// one the delta has, and one it doesn't
+			for _, p := range []struct {
+				actionID, content []byte
+			}{{actionID, content}, {other, otherContent}} {
+				outputID := mustHex(t, hashID(p.content))
+				pathname, err := c.Put(context.Background(), &request{ActionID: p.actionID, OutputID: outputID, Body: bytes.NewReader(p.content), BodySize: int64(len(p.content))})
+				if err != nil {
+					t.Fatalf("put: %v", err)
+				}
+				if data, err := os.ReadFile(pathname); err != nil || !bytes.Equal(data, p.content) {
+					t.Errorf("put gave the go command %s: %q, %v", pathname, data, err)
+				}
+				if got := get(t, c, p.actionID); got == "" {
+					t.Errorf("get after put missed")
+				}
+			}
+			if got := c.bucket.stats.DeltaPuts.Load(); got != 0 {
+				t.Errorf("delta puts = %d, want 0", got)
+			}
+			if got := c.bucket.stats.DeltaErrors.Load(); got == 0 && !tc.before {
+				t.Errorf("delta errors = 0, want the failed puts counted")
+			}
+
+			chmodTree(t, deltaDir, 0o644, 0o755)
+			if got := snapshotTree(t, deltaDir); !reflect.DeepEqual(got, before) {
+				t.Errorf("delta changed")
+			}
+		})
+	}
+}
+
+// TestPruneDelta_Unremovable checks that pruning counts what it can't remove,
+// such as another user's files, rather than stopping or saying nothing.
+func TestPruneDelta_Unremovable(t *testing.T) {
+	skipUnlessPermissionsApply(t)
+
+	dir := t.TempDir()
+	now := time.Now()
+	writeDeltaEntry(t, dir, 1, "used", now)
+	writeDeltaEntry(t, dir, 2, "unused", now.Add(-time.Hour))
+	chmodTree(t, dir, 0o444, 0o555)
+
+	result, err := pruneDelta(dir, pruneOptions{usedSince: now.Add(-time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Kept != 1 || result.Removed != 0 || result.Failed == 0 || result.Err == nil {
+		t.Errorf("result %+v, want 1 kept, none removed, and failures", result)
 	}
 }
 

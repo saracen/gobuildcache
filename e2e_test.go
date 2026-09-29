@@ -926,3 +926,173 @@ func TestEndToEnd_DeltaDamaged(t *testing.T) {
 		t.Errorf("delta has %d entries after putting the damaged ones again, want the first job's %d", len(entries), len(entries1))
 	}
 }
+
+// TestEndToEnd_DeltaUnusable checks that a job whose restored delta its user
+// can't read or write, as when a CI cache restores another user's files,
+// still builds and tests, treating what it can't use as missing, and that
+// pruning says what it couldn't remove.
+func TestEndToEnd_DeltaUnusable(t *testing.T) {
+	skipUnlessPermissionsApply(t)
+
+	tmp := t.TempDir()
+	goBin, bin, bucketURL := setupEndToEnd(t, tmp)
+
+	mod := filepath.Join(tmp, "mod")
+	writeModule(t, mod, map[string]string{
+		"go.mod":          "module example.com/unusable\n\ngo 1.24\n",
+		"lib/lib.go":      "package lib\n\nfunc Add(a, b int) int { return a + b }\n",
+		"lib/lib_test.go": "package lib\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { t.Log(Add(1, 2)) }\n",
+		"app/app.go":      "package app\n\nimport \"example.com/unusable/lib\"\n\nfunc Three() int { return lib.Add(1, 2) }\n",
+		"app/app_test.go": "package app\n\nimport \"testing\"\n\nfunc TestThree(t *testing.T) { t.Log(Three()) }\n",
+	})
+
+	goTest := func(t *testing.T, name string, flags ...string) (string, map[string]int64) {
+		t.Helper()
+
+		cmd := exec.Command(goBin, "test", "./...")
+		cmd.Dir = mod
+		cmd.Env = jobEnv(tmp, name, bin, bucketURL, append([]string{"-stats"}, flags...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: go test: %v\n%s", name, err, out)
+		}
+		return string(out), parseStats(t, string(out))
+	}
+	goTest(t, "writer")
+
+	writeModule(t, mod, map[string]string{
+		"lib/lib.go": "package lib\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Sub(a, b int) int { return a - b }\n",
+	})
+	delta1 := filepath.Join(tmp, "delta1")
+	goTest(t, "mr1", "-readonly", "-delta-dir", delta1)
+	entries1, bytes1 := deltaEntries(t, delta1)
+
+	t.Run("unreadable and unwritable", func(t *testing.T) {
+		delta := filepath.Join(tmp, "unwritable-delta")
+		copyTree(t, delta1, delta)
+		chmodTree(t, delta, 0, 0o555)
+
+		out, job := goTest(t, "unwritable", "-readonly", "-delta-dir", delta)
+		if job["put_errors"] != 0 || job["get_errors"] != 0 || job["delta_errors"] == 0 || job["delta_hits"] != 0 {
+			t.Errorf("want the delta treated as missing, with no errors from the go command's requests: %v\n%s", job, out)
+		}
+		if !strings.Contains(out, "delta dir isn't writable") {
+			t.Errorf("no warning that the delta dir isn't used:\n%s", out)
+		}
+
+		prune := exec.Command(bin, "prune", "-delta-dir", delta, "-used-since", time.Now().Format(time.RFC3339Nano))
+		out2, err := prune.CombinedOutput()
+		if err != nil || !strings.Contains(string(out2), "couldn't remove") {
+			t.Errorf("prune of a delta it can't change: want a warning: %v\n%s", err, out2)
+		}
+	})
+
+	// as a job running as root with umask 0022 saves it for one that isn't
+	t.Run("unwritable", func(t *testing.T) {
+		delta := filepath.Join(tmp, "readable-delta")
+		copyTree(t, delta1, delta)
+		before := snapshotTree(t, delta)
+		chmodTree(t, delta, 0o444, 0o555)
+
+		// changing lib again puts what the delta doesn't have
+		writeModule(t, mod, map[string]string{
+			"lib/lib.go": "package lib\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Sub(a, b int) int { return a - b }\n\nfunc Mul(a, b int) int { return a * b }\n",
+		})
+		defer writeModule(t, mod, map[string]string{
+			"lib/lib.go": "package lib\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Sub(a, b int) int { return a - b }\n",
+		})
+		out, job := goTest(t, "readable", "-readonly", "-delta-dir", delta)
+		if job["put_errors"] != 0 || job["get_errors"] != 0 || job["delta_errors"] != 1 || job["delta_puts"] != 0 || job["puts"] == 0 {
+			t.Errorf("want puts kept in -dir, and nothing else failing: %v\n%s", job, out)
+		}
+		if got := snapshotTree(t, delta); !reflect.DeepEqual(got, before) {
+			t.Errorf("job changed a delta it can't write to")
+		}
+
+		// what it has is still used
+		writeModule(t, mod, map[string]string{
+			"lib/lib.go": "package lib\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Sub(a, b int) int { return a - b }\n",
+		})
+		out, job = goTest(t, "readable-same", "-readonly", "-delta-dir", delta)
+		if job["put_errors"] != 0 || job["delta_hits"] == 0 || job["delta_puts"] != 0 || strings.Count(out, "(cached)") != 2 {
+			t.Errorf("want hits from a delta it can't write to: %v\n%s", job, out)
+		}
+	})
+
+	t.Run("unreadable files", func(t *testing.T) {
+		delta := filepath.Join(tmp, "unreadable-delta")
+		copyTree(t, delta1, delta)
+		chmodTree(t, delta, 0, 0o755)
+
+		out, job := goTest(t, "unreadable", "-readonly", "-delta-dir", delta)
+		if job["put_errors"] != 0 || job["get_errors"] != 0 || job["delta_puts"] == 0 || job["delta_damaged"] == 0 {
+			t.Errorf("want what couldn't be read computed and put again: %v\n%s", job, out)
+		}
+		if entries, size := deltaEntries(t, delta); !sameKeys(entries, entries1) || size != bytes1 {
+			t.Errorf("delta has %d entries, %d bytes after putting them again, want the first job's %d, %d", len(entries), size, len(entries1), bytes1)
+		}
+
+		// the next job gets them from the delta
+		next := filepath.Join(tmp, "unreadable-next-delta")
+		copyTree(t, delta, next)
+		if out, job := goTest(t, "unreadable-next", "-readonly", "-delta-dir", next); job["delta_hits"] == 0 || job["delta_puts"] != 0 || strings.Count(out, "(cached)") != 2 {
+			t.Errorf("job after putting them again: want every test cached and no puts: %v\n%s", job, out)
+		}
+	})
+}
+
+// skipUnlessPermissionsApply skips tests that make files unreadable or
+// directories unwritable, which doesn't stop root, and which Windows doesn't
+// do with file modes.
+func skipUnlessPermissionsApply(t *testing.T) {
+	t.Helper()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes don't restrict access on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("file modes don't restrict root")
+	}
+}
+
+// chmodTree sets the mode of every file under root to file, and of every
+// directory, root included, to dir, restoring them when the test ends so
+// that its temporary directory can be removed.
+func chmodTree(t *testing.T, root string, file, dir os.FileMode) {
+	t.Helper()
+
+	var files, dirs []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+		} else {
+			files = append(files, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, p := range dirs {
+			os.Chmod(p, 0o755)
+		}
+		for _, p := range files {
+			os.Chmod(p, 0o644)
+		}
+	})
+	for _, p := range files {
+		if err := os.Chmod(p, file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// deepest first, so each is still writable when its files are changed
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := os.Chmod(dirs[i], dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

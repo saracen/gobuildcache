@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -135,6 +136,25 @@ type outputUpload struct {
 	err  error
 }
 
+// createTemp creates a file in dir named prefix and a random number, and
+// opens it for writing. Unlike os.CreateTemp, whose files only their owner
+// can read, it gives the file mode 0666 less the umask, as the go command
+// does its cache's files. CI systems that restore caches for jobs running as
+// another user depend on that, such as GitLab Runner's Docker executor, which
+// runs jobs with umask 0000 so that whatever user a job runs as can use what
+// was restored.
+func createTemp(dir, prefix string) (*os.File, error) {
+	for range 10000 {
+		name := filepath.Join(dir, prefix+strconv.FormatUint(uint64(rand.Uint32()), 10))
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		return f, err
+	}
+	return nil, &os.PathError{Op: "createtemp", Path: filepath.Join(dir, prefix+"*"), Err: os.ErrExist}
+}
+
 func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (string, bool, error) {
 	outputPathname := filepath.Join(d.cacheDir, outputDir, outputID)
 
@@ -145,7 +165,7 @@ func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (str
 
 	slog.Debug("persisting to disk", "path", outputPathname)
 
-	f, err := os.CreateTemp(d.cacheDir, "output")
+	f, err := createTemp(d.cacheDir, "output")
 	if err != nil {
 		return "", false, fmt.Errorf("creating temporary output file: %w", err)
 	}
@@ -244,7 +264,7 @@ func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string
 
 	// Write to a temporary file and rename, so readers never see a partial link
 	// or one with the wrong time.
-	f, err := os.CreateTemp(filepath.Join(d.cacheDir, actionDir), actionID+".tmp.*")
+	f, err := createTemp(filepath.Join(d.cacheDir, actionDir), actionID+".tmp.")
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -576,7 +596,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 
 	slog.Debug("downloading", "output", outputID)
 
-	f, err := os.CreateTemp(b.disk.cacheDir, "output")
+	f, err := createTemp(b.disk.cacheDir, "output")
 	if err != nil {
 		return "", fmt.Errorf("creating temporary output file: %w", err)
 	}
