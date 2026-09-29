@@ -51,7 +51,7 @@ func retryable(err error) bool {
 // times. op must be safe to call again after a failure.
 //
 // An attempt that can't reach the bucket turns it off at once (see
-// unreachable and traceResponses), rather than being retried: SDKs that
+// unreachable and attemptTrace), rather than being retried: SDKs that
 // retry connection errors already did so within the attempt, some until its
 // timeout, so every call in flight would otherwise take several timeouts to
 // fail, and the breaker several such calls to trip. Turning the bucket off
@@ -59,6 +59,19 @@ func retryable(err error) bool {
 // retrying answers, such as 503s, until its timeout, for this process only
 // (see retriedAnswers).
 func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(context.Context) error) error {
+	return b.retry(ctx, timeout, false, op)
+}
+
+// uploadWithRetry is withRetry for op uploading an output, each attempt
+// bounded by transferTimeout. An attempt that sent its request to the
+// bucket reached it, answered or not (see attemptTrace.reached).
+func (b *Bucket) uploadWithRetry(ctx context.Context, op func(context.Context) error) error {
+	return b.retry(ctx, transferTimeout, true, op)
+}
+
+// retry is withRetry, taking an attempt that sent its request as reaching
+// the bucket if sending.
+func (b *Bucket) retry(ctx context.Context, timeout time.Duration, sending bool, op func(context.Context) error) error {
 	delay := retryDelay
 
 	done := b.stats.remoteCall()
@@ -66,7 +79,7 @@ func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(c
 
 	for attempt := 1; ; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		attemptCtx, responded := traceResponses(attemptCtx)
+		attemptCtx, trace := traceAttempt(attemptCtx)
 		stop := context.AfterFunc(b.remote.stopped(), cancel)
 		err := op(attemptCtx)
 		stop()
@@ -74,7 +87,7 @@ func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(c
 
 		if ctx.Err() == nil {
 			switch {
-			case !responded() && unreachable(err):
+			case !trace.reached(sending) && unreachable(err):
 				b.remote.tripUnreachable(err)
 			case retriedAnswers(err):
 				b.remote.trip(err)

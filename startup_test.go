@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -734,6 +735,26 @@ func trickle(sent *atomic.Int64) http.HandlerFunc {
 	}
 }
 
+// readSlowly reads r's body a little at a time, counting what it reads,
+// without answering, for up to d. Reads can go on from buffers after the
+// client gives up, so it stops then too.
+func readSlowly(r *http.Request, received *atomic.Int64, d time.Duration) {
+	start := time.Now()
+	buf := make([]byte, 1024)
+	for time.Since(start) < d {
+		n, err := r.Body.Read(buf)
+		received.Add(int64(n))
+		if err != nil {
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // A transfer the bucket answered but that's too slow to finish within an
 // attempt's timeout, such as a large output over a slow link, reached the
 // bucket, so it's an ordinary failure: it mustn't turn the bucket off for
@@ -801,22 +822,7 @@ func TestBreaker_SlowUploadIsNotShared(t *testing.T) {
 			w.Header().Set("Location", "http://"+r.Host+"/upload/session")
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/upload/session":
-			// Reads can go on from buffers after the client gives up, so
-			// stop once it has.
-			start := time.Now()
-			buf := make([]byte, 1024)
-			for time.Since(start) < 2*timeout {
-				n, err := r.Body.Read(buf)
-				received.Add(int64(n))
-				if err != nil {
-					return
-				}
-				select {
-				case <-r.Context().Done():
-					return
-				case <-time.After(20 * time.Millisecond):
-				}
-			}
+			readSlowly(r, &received, 2*timeout)
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
@@ -869,6 +875,250 @@ func TestBreaker_TransferWithoutAnAnswerIsShared(t *testing.T) {
 	if reason, err := os.ReadFile(b.remote.marker); err != nil || len(reason) == 0 {
 		t.Errorf("marker: %q, %v; want the reason", reason, err)
 	}
+}
+
+// An upload the SDK sends in one request, below its chunk or part size, is
+// only answered once it's all sent, so one read slowly past the attempt
+// timeout, as over a slow link, got no answer. It reached the bucket all the
+// same, so it's an ordinary failure too.
+func TestBreaker_SlowSingleRequestUploadIsNotShared(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+
+	tests := map[string]func(t *testing.T, dir string, upload http.HandlerFunc) *Bucket{
+		// a multipart upload, below the 16MiB chunk
+		"gcs": func(t *testing.T, dir string, upload http.HandlerFunc) *Bucket {
+			return emulatedGCS(t, dir, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("uploadType") == "multipart" {
+					upload(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				io.WriteString(w, `{"error":{"code":404,"message":"Not Found"}}`)
+			})
+		},
+		// a PutObject, below the 2MiB above which it sends Expect: 100-continue
+		"s3": func(t *testing.T, dir string, upload http.HandlerFunc) *Bucket {
+			return checkedBucket(t, openFakeS3(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut {
+					upload(w, r)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			})), dir)
+		},
+	}
+
+	for name, open := range tests {
+		t.Run(name, func(t *testing.T) {
+			fastRetries(t, timeout)
+
+			var received, uploads atomic.Int64
+			dir := t.TempDir()
+			b := open(t, dir, func(w http.ResponseWriter, r *http.Request) {
+				uploads.Add(1)
+				readSlowly(r, &received, 2*timeout)
+			})
+
+			outputID := strings.Repeat("e", 64)
+			if err := os.WriteFile(filepath.Join(dir, outputDir, outputID), bytes.Repeat([]byte{'x'}, 1<<20), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := b.uploadOutput(context.Background(), outputID); !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("upload = %v, want it to run out of time", err)
+			}
+			if received.Load() == 0 {
+				t.Fatal("the upload wasn't sent")
+			}
+			if got := uploads.Load(); got != int64(maxAttempts) {
+				t.Errorf("uploads = %d, want it retried as an ordinary failure", got)
+			}
+			if !b.remote.allow() {
+				t.Error("bucket turned off by a slow upload")
+			}
+			if _, err := os.Stat(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("slow upload shared as unreachability: %v", err)
+			}
+		})
+	}
+}
+
+// containerCredentials serves AWS credentials, expiring at expires, as a
+// container credentials endpoint does, and points the AWS SDK's default
+// chain at it alone. It counts the requests for them.
+func containerCredentials(t *testing.T, expires time.Time) *atomic.Int64 {
+	t.Helper()
+
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"AccessKeyId":"id","SecretAccessKey":"secret","Token":"token","Expiration":%q}`,
+			expires.UTC().Format(time.RFC3339))
+	}))
+	t.Cleanup(srv.Close)
+
+	none := filepath.Join(t.TempDir(), "none")
+	for k, v := range map[string]string{
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI":     srv.URL + "/creds",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "",
+		"AWS_CONFIG_FILE":                        none,
+		"AWS_SHARED_CREDENTIALS_FILE":            none,
+		"AWS_EC2_METADATA_DISABLED":              "true",
+		"AWS_ACCESS_KEY_ID":                      "",
+		"AWS_SECRET_ACCESS_KEY":                  "",
+		"AWS_SESSION_TOKEN":                      "",
+		"AWS_PROFILE":                            "",
+		"AWS_WEB_IDENTITY_TOKEN_FILE":            "",
+		"AWS_ROLE_ARN":                           "",
+	} {
+		t.Setenv(k, v)
+	}
+	return &requests
+}
+
+// openS3At opens an S3 bucket at endpoint as serve does, with the SDK's
+// default credentials chain.
+func openS3At(t *testing.T, endpoint string) *blob.Bucket {
+	t.Helper()
+
+	underlying, err := openBucket(context.Background(), "s3://bucket?region=us-east-1&use_path_style=true&endpoint="+url.QueryEscape(endpoint))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { underlying.Close() })
+	return underlying
+}
+
+// The AWS SDK fetches credentials with the call's context, and a process
+// starts without any, so its startup check always fetches them. The
+// credentials service answering doesn't mean the bucket can be reached.
+func TestStartup_S3CredentialsAnsweringDoNotHideAnUnreachableBucket(t *testing.T) {
+	quickStartup(t, 300*time.Millisecond)
+	credentials := containerCredentials(t, time.Now().Add(time.Hour))
+	silent := newSilentListener(t)
+
+	b := checkedBucket(t, openS3At(t, "http://"+silent.Addr().String()), t.TempDir())
+
+	start := time.Now()
+	if b.useRemote() {
+		t.Error("bucket still in use")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("startup check took %v, want it to give up at its bound", took)
+	}
+	if credentials.Load() == 0 || silent.accepted.Load() == 0 {
+		t.Fatalf("credential requests = %d, bucket connections = %d; want both", credentials.Load(), silent.accepted.Load())
+	}
+	if reason, err := os.ReadFile(b.remote.marker); err != nil || len(reason) == 0 {
+		t.Errorf("marker: %q, %v; want the reason", reason, err)
+	}
+}
+
+// Credentials that have expired are fetched again by the call that finds
+// them expired, so the same holds for a lookup, once the bucket goes away.
+func TestBreaker_S3CredentialsAnsweringDoNotHideAnUnreachableBucket(t *testing.T) {
+	fastRetries(t, 300*time.Millisecond)
+	credentials := containerCredentials(t, time.Now().Add(-time.Minute))
+
+	var gone atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if gone.Load() {
+			<-r.Context().Done()
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := checkedBucket(t, openS3At(t, srv.URL), t.TempDir())
+	if !b.useRemote() {
+		t.Fatal("bucket turned off at startup")
+	}
+	before := credentials.Load()
+
+	gone.Store(true)
+	if _, _, err := b.OutputIDFromAction(context.Background(), someAction); err == nil {
+		t.Error("lookup nothing answered succeeded")
+	}
+	if credentials.Load() == before {
+		t.Fatal("the lookup didn't fetch credentials")
+	}
+	if got := b.stats.Retries.Load(); got != 0 {
+		t.Errorf("retries = %d, want the first attempt to turn the bucket off", got)
+	}
+	if b.remote.allow() {
+		t.Error("bucket still in use")
+	}
+	if reason, err := os.ReadFile(b.remote.marker); err != nil || len(reason) == 0 {
+		t.Errorf("marker: %q, %v; want the reason", reason, err)
+	}
+}
+
+// An attempt reached the host it asked last if that host answered it, or,
+// for an upload, was sent a request.
+func TestTraceAttempt(t *testing.T) {
+	answers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+	}))
+	t.Cleanup(answers.Close)
+	slowReader := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		readSlowly(r, new(atomic.Int64), time.Second)
+	}))
+	t.Cleanup(slowReader.Close)
+	silent := "http://" + newSilentListener(t).Addr().String()
+	refused := httptest.NewServer(http.NotFoundHandler())
+	refused.Close()
+
+	get := func(url string) tracedRequest { return tracedRequest{http.MethodGet, url, 0} }
+	put := func(url string) tracedRequest { return tracedRequest{http.MethodPut, url, 1 << 20} }
+
+	tests := map[string]struct {
+		requests       []tracedRequest
+		lookup, upload bool
+	}{
+		"answered":                      {[]tracedRequest{get(answers.URL)}, true, true},
+		"refused":                       {[]tracedRequest{get(refused.URL)}, false, false},
+		"not answered":                  {[]tracedRequest{get(silent)}, false, true},
+		"upload read slowly":            {[]tracedRequest{put(slowReader.URL)}, false, true},
+		"upload after an answer":        {[]tracedRequest{get(slowReader.URL), put(slowReader.URL)}, true, true},
+		"another host answered first":   {[]tracedRequest{get(answers.URL), get(refused.URL)}, false, false},
+		"another host answered, silent": {[]tracedRequest{get(answers.URL), get(silent)}, false, true},
+		"answered, then another host":   {[]tracedRequest{get(refused.URL), get(answers.URL)}, true, true},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctx, trace := traceAttempt(context.Background())
+			client := &http.Client{Transport: &http.Transport{}}
+			defer client.CloseIdleConnections()
+
+			for _, req := range tc.requests {
+				ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+				r, err := http.NewRequestWithContext(ctx, req.method, req.url, bytes.NewReader(make([]byte, req.size)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp, err := client.Do(r); err == nil {
+					resp.Body.Close()
+				}
+				cancel()
+			}
+
+			if got := trace.reached(false); got != tc.lookup {
+				t.Errorf("reached(false) = %v, want %v", got, tc.lookup)
+			}
+			if got := trace.reached(true); got != tc.upload {
+				t.Errorf("reached(true) = %v, want %v", got, tc.upload)
+			}
+		})
+	}
+}
+
+type tracedRequest struct {
+	method, url string
+	size        int
 }
 
 // Errors that answer, such as an unauthorized anonymous caller, aren't

@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"gocloud.dev/gcerrors"
@@ -108,9 +108,8 @@ func (b *Bucket) checkRemote() {
 		return
 	}
 
-	ctx, responded := traceResponses(context.Background())
-	switch err := b.probe(ctx); {
-	case !responded() && unreachable(err):
+	switch err := b.probe(); {
+	case unreachable(err):
 		b.remote.tripUnreachable(fmt.Errorf("checking bucket: %w", err))
 	case retriedAnswers(err):
 		b.remote.trip(fmt.Errorf("checking bucket: %w", err))
@@ -118,11 +117,11 @@ func (b *Bucket) checkRemote() {
 }
 
 // probe looks up probeKey, giving up after startupTimeout.
-func (b *Bucket) probe(ctx context.Context) error {
+func (b *Bucket) probe() error {
 	done := b.stats.remoteCall()
 	defer done()
 
-	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancel()
 
 	// Not every SDK call returns when its context ends: a GCS call waiting
@@ -157,8 +156,9 @@ func (b *Bucket) probe(ctx context.Context) error {
 // aren't recognised either, and count towards the breaker as other errors
 // do. Nor is running out of time retrying answers (see retriedAnswers).
 //
-// A deadline doesn't show whether it came before or after an answer, so
-// callers also check that the call got no response (see traceResponses).
+// A deadline doesn't show whether it came before or after the bucket was
+// reached, so withRetry also checks the attempt's requests (see
+// attemptTrace).
 func unreachable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || gcerrors.Code(err) == gcerrors.Canceled {
 		return false
@@ -182,27 +182,73 @@ func unreachable(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-// traceResponses returns ctx with a trace noting when a response starts to
-// arrive for any HTTP request made with it, and a function that reports
-// whether one has.
+// attemptTrace notes how far an attempt's HTTP requests got with each host
+// they went to, for withRetry to tell whether the attempt reached the bucket.
 //
-// A call that got a response reached the bucket, whatever it failed with
-// after: a healthy transfer too slow to finish within transferTimeout ends
-// with the same deadline error as a call nothing answered, and taking it as
+// A call that reached the bucket did so whatever it failed with after: a
+// healthy transfer too slow to finish within transferTimeout ends with the
+// same deadline error as a call nothing reached, and taking it as
 // unreachability would turn the bucket off for every process sharing the
-// marker. The SDKs make their requests with the call's context, whichever
-// provider is behind the bucket. Token requests use the context the
-// credentials were created with, so a token service answering doesn't count,
-// and a token exchange that never answers still leaves the bucket
-// unreachable. An upload the GCS client sends in one request, one smaller
-// than its chunk size, is only answered once it's all sent, so one that runs
-// out of time still counts as unreachable.
-func traceResponses(ctx context.Context) (context.Context, func() bool) {
-	var responded atomic.Bool
+// marker.
+//
+// Only the host of the attempt's latest request counts. The S3 and Azure
+// SDKs fetch credentials with the call's context, before asking the bucket,
+// so a credentials service answering doesn't show that the bucket can be
+// reached, and one that doesn't answer leaves the attempt unreachable, as
+// the bucket not answering does. The GCS client's token requests don't
+// carry the call's context, so they aren't traced at all.
+//
+// Each event is taken as the latest request's: an SDK makes an attempt's
+// requests one after another, or in parallel only to the bucket.
+type attemptTrace struct {
+	mu       sync.Mutex
+	host     string
+	sent     map[string]bool
+	answered map[string]bool
+}
+
+// traceAttempt returns ctx with a trace of the HTTP requests made with it,
+// recorded in the attemptTrace it returns.
+func traceAttempt(ctx context.Context) (context.Context, *attemptTrace) {
+	t := &attemptTrace{sent: map[string]bool{}, answered: map[string]bool{}}
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GotFirstResponseByte: func() { responded.Store(true) },
+		// Called for every request, before a connection is dialed or
+		// reused, over HTTP/1 and HTTP/2 alike.
+		GetConn: func(hostPort string) {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			t.host = hostPort
+		},
+		WroteHeaders: func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			t.sent[t.host] = true
+		},
+		GotFirstResponseByte: func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			t.answered[t.host] = true
+		},
 	})
-	return ctx, responded.Load
+	return ctx, t
+}
+
+// reached reports whether the host of the attempt's latest request answered
+// any of the attempt's requests or, if sending, was sent one.
+//
+// An upload the SDK sends in one request, as each of them does below its
+// chunk or part size, may only be answered once it's all sent, and bytes the
+// transport has written can still be queued behind a slow link. So sending
+// counts an upload whose request went out on a connection as reached, even
+// if nothing answered: it may well be moving bytes when time runs out. A
+// server that accepts connections and never reads is taken as reached too,
+// but the call made before each upload, a lookup of the output or a copy of
+// the entry, finds a bucket like that. A request without a body is sent at
+// once, so for other calls only an answer counts.
+func (t *attemptTrace) reached(sending bool) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.answered[t.host] || sending && t.sent[t.host]
 }
 
 // remoteDisabledMarker returns the path of the marker in dir for the bucket

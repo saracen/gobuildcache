@@ -479,7 +479,7 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	defer f.Close()
 
 	n := &countingReader{r: f}
-	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
+	err = b.uploadWithRetry(ctx, func(ctx context.Context) error {
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			return err
 		}

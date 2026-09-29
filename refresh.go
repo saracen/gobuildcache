@@ -153,7 +153,7 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 		r = f
 	}
 
-	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
+	err = b.uploadWithRetry(ctx, func(ctx context.Context) error {
 		return write(func() error {
 			if _, err := r.Seek(0, io.SeekStart); err != nil {
 				return err
