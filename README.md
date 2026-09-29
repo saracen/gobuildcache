@@ -54,7 +54,7 @@ A readonly job only gets from the bucket what trusted writers put there, so a me
 - Put times, and so `go clean -testcache`, work as for `-dir`. A put time is the modification time of the entry's action link, so whatever saves and restores the delta dir must keep modification times, as GitLab's cache does.
 - Each output is checked against its ID, a SHA-256 of its contents, before it's used, once per process. Restoring a CI cache can leave outputs damaged, such as truncated when extracting a file fails part way, and the go command uses most outputs as they are. A damaged output, or anything but a regular file in its place, is removed, so its entries are misses, and the go command computes them and puts them again.
 
-A delta is small: in gitlab-runner's integration test jobs, 1 to 14 MB, against 1 to 3 GB downloaded from the bucket.
+A delta is usually small: in gitlab-runner's integration test jobs, 1 to 14 MB, against 1 to 3 GB downloaded from the bucket. A change to a package most of the module imports makes it much bigger, since everything that imports the package is compiled again and every test of those is rerun. An exported addition to gitlab-runner's `common` package made a delta of about 400 MB (80 to 100 MB compressed) in its unit test job, which tests each package with `-race` and `-coverpkg` of the whole module, and 180 to 270 MB in its integration test job.
 
 The delta should stay the merge request's working set, not grow with every change pushed to it. Each entry records when it was last used, meaning got or put, and after the job's go commands, `gobuildcache prune` removes the entries the job didn't use, and the outputs nothing links to any more:
 
@@ -63,7 +63,7 @@ gobuildcache prune -delta-dir <dir> -used-since <when the job started> [-max-siz
 ```
 
 - `-used-since` takes Unix seconds, as `date +%s` prints, or an RFC 3339 time. Take it on the machine running the job, before its first go command: when an entry was used is by that machine's clock. If no entry was used since, as when the job failed before its go commands ran, prune says so and only applies `-max-size`, so that a retry still has the delta.
-- `-max-size` then removes the least recently used entries until their outputs take at most this size, in bytes or with a `KiB`, `MiB` or `GiB` suffix. It can also be used alone.
+- `-max-size` then removes the least recently used entries until their outputs take at most this size, in bytes or with a `KiB`, `MiB` or `GiB` suffix. It can also be used alone. Set it above what a change to the module's most imported package puts: a job whose delta doesn't fit computes what was removed again in every pipeline.
 - Run it after the job's go commands, and before the CI cache saves the delta dir. It only removes what gobuildcache writes there, including temporary files that killed processes left.
 
 A job trusts the delta as much as whatever wrote the CI cache it came from: in GitLab, any pipeline that can write the project's unprotected caches, which includes any merge request's pipelines running its own CI configuration. Only give one to jobs whose results nothing depends on, such as merge request pipelines that don't gate a merge, and key it to the merge request and the job.
@@ -99,9 +99,9 @@ test:
     # delta, such as the tests it didn't get to, so keep those.
     - |
       if [ "$CI_JOB_STATUS" = success ]; then
-        gobuildcache prune -delta-dir .gobuildcache/delta -used-since "$(cat .gobuildcache/started)" -max-size 256MiB
+        gobuildcache prune -delta-dir .gobuildcache/delta -used-since "$(cat .gobuildcache/started)" -max-size 1GiB
       else
-        gobuildcache prune -delta-dir .gobuildcache/delta -max-size 256MiB
+        gobuildcache prune -delta-dir .gobuildcache/delta -max-size 1GiB
       fi
 ```
 
