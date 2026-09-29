@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -643,6 +644,74 @@ func TestStartup_ServerErrorsPastTheBoundAreNotShared(t *testing.T) {
 	}
 	if !other.remote.allow() {
 		t.Error("bucket turned off for another process")
+	}
+}
+
+// openFakeAzure opens an Azure container served by h as serve does, with a
+// shared key.
+func openFakeAzure(t *testing.T, h http.Handler) *blob.Bucket {
+	t.Helper()
+
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	for k, v := range map[string]string{
+		"AZURE_STORAGE_ACCOUNT":              "account",
+		"AZURE_STORAGE_KEY":                  base64.StdEncoding.EncodeToString([]byte("key")),
+		"AZURE_STORAGE_SAS_TOKEN":            "",
+		"AZURE_STORAGE_CONNECTION_STRING":    "",
+		"AZURE_STORAGEBLOB_CONNECTIONSTRING": "",
+	} {
+		t.Setenv(k, v)
+	}
+
+	underlying, err := openBucket(context.Background(), "azblob://container?protocol=http&domain="+url.QueryEscape(srv.Listener.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { underlying.Close() })
+	return underlying
+}
+
+// The S3 and Azure SDKs, unlike the GCS client, return only the deadline
+// when their context ends while retrying answers, so the startup check
+// can't tell from the error that the bucket answered.
+func TestStartup_S3AndAzureServerErrorsPastTheBoundAreNotShared(t *testing.T) {
+	tests := map[string]struct {
+		bound, answerAfter time.Duration
+		open               func(t *testing.T, h http.Handler) *blob.Bucket
+	}{
+		// retried at most twice, after up to 2s and then up to 4s
+		"s3": {300 * time.Millisecond, 120 * time.Millisecond, openFakeS3},
+		// retried after about 0.8s, and then about 2.4s
+		"azure": {2 * time.Second, 300 * time.Millisecond, openFakeAzure},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			quickStartup(t, tc.bound)
+
+			var answers atomic.Int64
+			dir := t.TempDir()
+			b := checkedBucket(t, tc.open(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(tc.answerAfter)
+				answers.Add(1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+			})), dir)
+
+			start := time.Now()
+			if b.useRemote() {
+				t.Error("bucket still in use after the check spent its bound on errors")
+			}
+			if took := time.Since(start); took > tc.bound+time.Second {
+				t.Errorf("startup check took %v, want about its bound", took)
+			}
+			if answers.Load() == 0 {
+				t.Fatal("the check got no answer")
+			}
+			if reason, err := os.ReadFile(b.remote.marker); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("server errors shared as unreachability: %q, %v", reason, err)
+			}
+		})
 	}
 }
 

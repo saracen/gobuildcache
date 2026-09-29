@@ -97,6 +97,13 @@ func (b *breaker) checkMarker() {
 // the bucket answered, but with errors the SDK retried until then, it's
 // turned off for this process only (see retriedAnswers).
 //
+// Only the GCS client keeps the answer it was retrying when its context
+// ends, so the lookup is traced as withRetry's attempts are (see
+// attemptTrace): an S3 or Azure bucket answering 503s for longer than the
+// bound ends with the same deadline error as one that never answered. A
+// lookup of a missing key that the bucket answered, and that ran out of
+// time anyway, was retrying answers.
+//
 // Any other answer is left to the process's own calls, which count towards
 // the breaker as usual: looking up a key nothing writes only shows whether
 // the bucket can be reached. How a bucket answers for a missing key depends
@@ -108,21 +115,25 @@ func (b *Bucket) checkRemote() {
 		return
 	}
 
-	switch err := b.probe(); {
-	case unreachable(err):
+	trace, err := b.probe()
+	reached := trace.reached(false)
+	switch {
+	case !reached && unreachable(err):
 		b.remote.tripUnreachable(fmt.Errorf("checking bucket: %w", err))
-	case retriedAnswers(err):
+	case retriedAnswers(err), reached && errors.Is(err, context.DeadlineExceeded):
 		b.remote.trip(fmt.Errorf("checking bucket: %w", err))
 	}
 }
 
-// probe looks up probeKey, giving up after startupTimeout.
-func (b *Bucket) probe() error {
+// probe looks up probeKey, giving up after startupTimeout, and returns the
+// lookup's trace with its result.
+func (b *Bucket) probe() (*attemptTrace, error) {
 	done := b.stats.remoteCall()
 	defer done()
 
 	ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancel()
+	ctx, trace := traceAttempt(ctx)
 
 	// Not every SDK call returns when its context ends: a GCS call waiting
 	// on a token exchange waits for the exchange, whose own timeout is
@@ -135,15 +146,15 @@ func (b *Bucket) probe() error {
 
 	select {
 	case err := <-result:
-		return err
+		return trace, err
 	case <-ctx.Done():
 	}
 
 	select {
 	case err := <-result:
-		return err
+		return trace, err
 	case <-time.After(probeGrace):
-		return fmt.Errorf("no answer within %v: %w", startupTimeout, ctx.Err())
+		return trace, fmt.Errorf("no answer within %v: %w", startupTimeout, ctx.Err())
 	}
 }
 
@@ -157,8 +168,8 @@ func (b *Bucket) probe() error {
 // do. Nor is running out of time retrying answers (see retriedAnswers).
 //
 // A deadline doesn't show whether it came before or after the bucket was
-// reached, so withRetry also checks the attempt's requests (see
-// attemptTrace).
+// reached, so withRetry and the startup check also check the requests made
+// (see attemptTrace).
 func unreachable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || gcerrors.Code(err) == gcerrors.Canceled {
 		return false
@@ -183,7 +194,8 @@ func unreachable(err error) bool {
 }
 
 // attemptTrace notes how far an attempt's HTTP requests got with each host
-// they went to, for withRetry to tell whether the attempt reached the bucket.
+// they went to, for withRetry and the startup check to tell whether the
+// attempt reached the bucket.
 //
 // A call that reached the bucket did so whatever it failed with after: a
 // healthy transfer too slow to finish within transferTimeout ends with the
