@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"gocloud.dev/gcerrors"
+	"google.golang.org/api/googleapi"
 )
 
 // Every call to the bucket goes through withRetry, which bounds how long it
@@ -25,9 +28,19 @@ var (
 	maxAttempts = 3
 
 	// metadataTimeout bounds each attempt at a lookup or small write, and
-	// transferTimeout each attempt at moving an output.
+	// transferTimeout each attempt at moving an output, however steadily it's
+	// moving. A transfer still moving at transferTimeout isn't tried again,
+	// as it would take as long again.
 	metadataTimeout = 30 * time.Second
-	transferTimeout = 5 * time.Minute
+	transferTimeout = 30 * time.Minute
+
+	// transferIdleTimeout ends an attempt at moving an output once none of it
+	// has moved for this long, which is what keeps a stuck transfer from
+	// taking transferTimeout. A download is moving as long as its bytes
+	// arrive, and is tried again if it stops. An upload only shows it's moving
+	// while the SDK reads what it sends, so this is long enough for an SDK to
+	// send a buffered chunk, 16 MiB for GCS, over a slow link.
+	transferIdleTimeout = 2 * time.Minute
 
 	// retryDelay is the wait before the first retry, doubled for each one
 	// after, with jitter.
@@ -70,17 +83,29 @@ func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(c
 	return b.call(ctx, timeout, callOptions{}, op)
 }
 
-// uploadWithRetry is withRetry for op uploading an output, each attempt
-// bounded by transferTimeout. An attempt that sent its request to the
+// downloadWithRetry is withRetry for op downloading an output, each attempt
+// bounded by transferTimeout and transferIdleTimeout. op reads the output
+// through movingReader, which is how the attempt knows it's moving.
+func (b *Bucket) downloadWithRetry(ctx context.Context, op func(context.Context) error) error {
+	return b.call(ctx, transferTimeout, callOptions{transfer: true}, op)
+}
+
+// uploadWithRetry is downloadWithRetry for op uploading an output, which it
+// reads through movingReader too. An attempt that sent its request to the
 // bucket reached it, answered or not (see attemptTrace.reached).
 func (b *Bucket) uploadWithRetry(ctx context.Context, op func(context.Context) error) error {
-	return b.call(ctx, transferTimeout, callOptions{sending: true}, op)
+	return b.call(ctx, transferTimeout, callOptions{sending: true, transfer: true}, op)
 }
 
 // callOptions are how call makes a call, when it isn't as withRetry does.
 type callOptions struct {
 	// sending takes an attempt that sent its request as reaching the bucket.
 	sending bool
+
+	// transfer bounds each attempt by transferIdleTimeout too, and doesn't
+	// try again after one still moving at its timeout, nor an upload that
+	// went out.
+	transfer bool
 
 	// unrecorded leaves the result out of the breaker, for a call whose
 	// failure doesn't show whether the bucket works, nor its success that it
@@ -90,7 +115,7 @@ type callOptions struct {
 
 // call is withRetry, with opts.
 func (b *Bucket) call(ctx context.Context, timeout time.Duration, opts callOptions, op func(context.Context) error) error {
-	err := b.retry(ctx, timeout, opts.sending, op)
+	err := b.retry(ctx, timeout, opts, op)
 	if !opts.unrecorded && !inconclusive(err) {
 		b.remote.record(err)
 	}
@@ -145,9 +170,8 @@ func (l diskReader) Read(p []byte) (int, error) {
 	return n, onDisk(err)
 }
 
-// retry is call's loop, taking an attempt that sent its request as reaching
-// the bucket if sending.
-func (b *Bucket) retry(ctx context.Context, timeout time.Duration, sending bool, op func(context.Context) error) error {
+// retry is call's loop.
+func (b *Bucket) retry(ctx context.Context, timeout time.Duration, opts callOptions, op func(context.Context) error) error {
 	delay := retryDelay
 
 	done := b.stats.remoteCall()
@@ -156,20 +180,36 @@ func (b *Bucket) retry(ctx context.Context, timeout time.Duration, sending bool,
 	for attempt := 1; ; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		attemptCtx, trace := traceAttempt(attemptCtx)
+		var watch *transferWatch
+		if opts.transfer {
+			attemptCtx, watch = watchTransfer(attemptCtx, cancel, transferIdleTimeout)
+		}
 		stop := context.AfterFunc(b.remote.stopped(), cancel)
 		err := op(attemptCtx)
 		stop()
+		timedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
 		cancel()
+		stalled := watch != nil && watch.stop() && err != nil
+		if stalled {
+			err = &stalledError{idle: transferIdleTimeout, err: err}
+		}
 
 		if ctx.Err() == nil && !inconclusive(err) {
 			switch {
-			case !trace.reached(sending) && unreachable(err):
+			case !trace.reached(opts.sending) && unreachable(err):
 				b.remote.tripUnreachable(err)
 			case retriedAnswers(err):
 				b.remote.trip(err)
 			}
 		}
 		if err == nil || !retryable(err) || attempt >= maxAttempts || ctx.Err() != nil || !b.remote.allow() {
+			return err
+		}
+		// A transfer still moving at its timeout would take as long again. An
+		// upload's moving can't be told once the SDK has read what it sends:
+		// it may still be going out over a slow link, so one that went out
+		// isn't tried again either.
+		if opts.transfer && trace.reached(opts.sending) && (timedOut || stalled && opts.sending) {
 			return err
 		}
 
@@ -184,4 +224,91 @@ func (b *Bucket) retry(ctx context.Context, timeout time.Duration, sending bool,
 		}
 		delay *= 2
 	}
+}
+
+// transferWatch ends an attempt at a transfer once none of it has moved for
+// its idle timeout, which movingReader tells it.
+type transferWatch struct {
+	last    atomic.Int64 // UnixNano of when bytes last moved
+	stalled atomic.Bool
+	done    chan struct{}
+}
+
+type transferWatchKey struct{}
+
+// watchTransfer returns ctx with a transferWatch, which calls cancel once
+// nothing has moved for idle.
+func watchTransfer(ctx context.Context, cancel context.CancelFunc, idle time.Duration) (context.Context, *transferWatch) {
+	w := &transferWatch{done: make(chan struct{})}
+	w.moved()
+
+	go func() {
+		tick := time.NewTicker(idle / 8)
+		defer tick.Stop()
+		for {
+			select {
+			case <-w.done:
+				return
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if time.Since(time.Unix(0, w.last.Load())) >= idle {
+					w.stalled.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	return context.WithValue(ctx, transferWatchKey{}, w), w
+}
+
+func (w *transferWatch) moved() {
+	w.last.Store(time.Now().UnixNano())
+}
+
+// stop stops watching, and reports whether the transfer stalled.
+func (w *transferWatch) stop() bool {
+	close(w.done)
+	return w.stalled.Load()
+}
+
+// movingReader tells the transfer watching ctx, if any, whenever bytes are
+// read through it.
+type movingReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (m movingReader) Read(p []byte) (int, error) {
+	n, err := m.r.Read(p)
+	if n > 0 {
+		if w, ok := m.ctx.Value(transferWatchKey{}).(*transferWatch); ok {
+			w.moved()
+		}
+	}
+	return n, err
+}
+
+// stalledError is a transfer ended because none of it moved for idle. It's a
+// deadline, as one that ran out of time, rather than the cancellation that
+// ended it, and keeps any answer the SDK was retrying, as the deadline would
+// have (see retriedAnswers).
+type stalledError struct {
+	idle time.Duration
+	err  error
+}
+
+func (e *stalledError) Error() string {
+	return fmt.Sprintf("nothing moved for %v: %v", e.idle, e.err)
+}
+
+func (e *stalledError) Unwrap() []error {
+	errs := []error{context.DeadlineExceeded}
+	var apiErr *googleapi.Error
+	if errors.As(e.err, &apiErr) {
+		errs = append(errs, apiErr)
+	}
+	return errs
 }

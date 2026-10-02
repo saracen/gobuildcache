@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,12 +26,12 @@ import (
 func fastRetries(t *testing.T, timeout time.Duration) {
 	t.Helper()
 
-	attempts, metadata, transfer, delay := maxAttempts, metadataTimeout, transferTimeout, retryDelay
+	attempts, metadata, transfer, idle, delay := maxAttempts, metadataTimeout, transferTimeout, transferIdleTimeout, retryDelay
 	t.Cleanup(func() {
-		maxAttempts, metadataTimeout, transferTimeout, retryDelay = attempts, metadata, transfer, delay
+		maxAttempts, metadataTimeout, transferTimeout, transferIdleTimeout, retryDelay = attempts, metadata, transfer, idle, delay
 	})
 
-	maxAttempts, metadataTimeout, transferTimeout, retryDelay = 3, timeout, timeout, time.Millisecond
+	maxAttempts, metadataTimeout, transferTimeout, transferIdleTimeout, retryDelay = 3, timeout, timeout, timeout, time.Millisecond
 }
 
 func TestRetryable(t *testing.T) {
@@ -369,3 +370,134 @@ func TestWithRetry_LocalErrorsSayNothing(t *testing.T) {
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("no space left on device") }
+
+// tricklingServer answers with a byte every interval, for total if it's
+// set, and otherwise until the request ends. It counts its requests.
+func tricklingServer(t *testing.T, interval, total time.Duration, requests *atomic.Int64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		flusher := w.(http.Flusher)
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		start := time.Now()
+		for total == 0 || time.Since(start) < total {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(interval):
+			}
+			if _, err := w.Write([]byte("x")); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// download reads url through movingReader, as GetOutput reads an output.
+func download(ctx context.Context, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, err = io.Copy(io.Discard, movingReader{ctx, resp.Body})
+	return err
+}
+
+func TestTransfer_StalledIsRetriedAsADeadline(t *testing.T) {
+	fastRetries(t, 5*time.Second)
+	transferIdleTimeout = 50 * time.Millisecond
+	b := &Bucket{}
+
+	// answers, then never sends a byte
+	var requests atomic.Int64
+	srv := tricklingServer(t, time.Hour, 0, &requests)
+
+	start := time.Now()
+	err := b.downloadWithRetry(context.Background(), func(ctx context.Context) error {
+		return download(ctx, srv.URL)
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want a deadline", err)
+	}
+	if got := requests.Load(); got != int64(maxAttempts) {
+		t.Errorf("requests = %d, want %d: a stall is retried", got, maxAttempts)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("took %v, want each attempt ended once nothing moved", took)
+	}
+	if !b.remote.allow() {
+		t.Error("a bucket that answered isn't unreachable")
+	}
+}
+
+func TestTransfer_MovingIsntCutShort(t *testing.T) {
+	fastRetries(t, 5*time.Second)
+	transferIdleTimeout = 100 * time.Millisecond
+	b := &Bucket{}
+
+	// takes longer than the idle timeout, but moving all the while
+	var requests atomic.Int64
+	srv := tricklingServer(t, 10*time.Millisecond, 400*time.Millisecond, &requests)
+
+	err := b.downloadWithRetry(context.Background(), func(ctx context.Context) error {
+		return download(ctx, srv.URL)
+	})
+	if err != nil {
+		t.Errorf("err = %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("requests = %d, want 1", got)
+	}
+}
+
+func TestTransfer_MovingAtItsTimeoutIsntRetried(t *testing.T) {
+	fastRetries(t, 300*time.Millisecond)
+	transferIdleTimeout = 100 * time.Millisecond
+	b := &Bucket{}
+
+	var requests atomic.Int64
+	srv := tricklingServer(t, 10*time.Millisecond, 0, &requests)
+
+	err := b.downloadWithRetry(context.Background(), func(ctx context.Context) error {
+		return download(ctx, srv.URL)
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want a deadline", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("requests = %d, want 1: it would take as long again", got)
+	}
+}
+
+// The GCS client retries a 503 until its context ends, moving nothing, so the
+// stall ends it, and the process gives up on the bucket, as it did when the
+// attempt's timeout ended it (see retriedAnswers).
+func TestGCS_DownloadRetryingAnswersStalls(t *testing.T) {
+	fastRetries(t, 5*time.Second)
+	transferIdleTimeout = 100 * time.Millisecond
+	transport := &fakeGCS{method: http.MethodGet}
+	transport.failures.Store(-1)
+	b := newFakeGCSBucket(t, transport)
+
+	start := time.Now()
+	got, err := b.GetOutput(context.Background(), strings.Repeat("a", 64))
+	if err == nil || got != "" {
+		t.Errorf("GetOutput = %q, %v; want an error", got, err)
+	}
+	if b.remote.allow() {
+		t.Error("the bucket should be off for this process")
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("took %v", took)
+	}
+}

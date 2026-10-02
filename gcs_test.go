@@ -584,8 +584,8 @@ func TestGCSTransport_SlowUploadIsNotShared(t *testing.T) {
 	if received.Load() == 0 {
 		t.Fatal("the upload wasn't sent")
 	}
-	if got := uploads.Load(); got != int64(maxAttempts) {
-		t.Errorf("uploads = %d, want it retried as an ordinary failure", got)
+	if got := uploads.Load(); got != 1 {
+		t.Errorf("uploads = %d, want 1: one that went out isn't tried again", got)
 	}
 	if !b.remote.allow() {
 		t.Error("bucket turned off by a slow upload")

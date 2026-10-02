@@ -826,8 +826,9 @@ func readSlowly(r *http.Request, received *atomic.Int64, d time.Duration) {
 
 // A transfer the bucket answered but that's too slow to finish within an
 // attempt's timeout, such as a large output over a slow link, reached the
-// bucket, so it's an ordinary failure: it mustn't turn the bucket off for
-// the other processes sharing the marker.
+// bucket, so it's an ordinary failure, not tried again since it would take as
+// long: it mustn't turn the bucket off for the other processes sharing the
+// marker.
 func TestBreaker_SlowDownloadIsNotShared(t *testing.T) {
 	fastRetries(t, 300*time.Millisecond)
 
@@ -847,8 +848,8 @@ func TestBreaker_SlowDownloadIsNotShared(t *testing.T) {
 	if sent.Load() == 0 {
 		t.Fatal("the download got no answer")
 	}
-	if got := b.stats.Retries.Load(); got != int64(maxAttempts-1) {
-		t.Errorf("retries = %d, want it retried as an ordinary failure", got)
+	if got := b.stats.Retries.Load(); got != 0 {
+		t.Errorf("retries = %d, want none: still moving, it would take as long again", got)
 	}
 	if got := b.remote.failures.Load(); got != 1 {
 		t.Errorf("failures = %d, want the download counted once", got)
@@ -949,7 +950,7 @@ func TestBreaker_TransferWithoutAnAnswerIsShared(t *testing.T) {
 // An upload the SDK sends in one request, below its chunk or part size, is
 // only answered once it's all sent, so one read slowly past the attempt
 // timeout, as over a slow link, got no answer. It reached the bucket all the
-// same, so it's an ordinary failure too.
+// same, so it's an ordinary failure too, and not tried again.
 func TestBreaker_SlowSingleRequestUploadIsNotShared(t *testing.T) {
 	const timeout = 300 * time.Millisecond
 
@@ -1000,8 +1001,8 @@ func TestBreaker_SlowSingleRequestUploadIsNotShared(t *testing.T) {
 			if received.Load() == 0 {
 				t.Fatal("the upload wasn't sent")
 			}
-			if got := uploads.Load(); got != int64(maxAttempts) {
-				t.Errorf("uploads = %d, want it retried as an ordinary failure", got)
+			if got := uploads.Load(); got != 1 {
+				t.Errorf("uploads = %d, want 1: one that went out isn't tried again", got)
 			}
 			if !b.remote.allow() {
 				t.Error("bucket turned off by a slow upload")

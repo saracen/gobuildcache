@@ -502,7 +502,7 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 			return onDisk(err)
 		}
 		n.n = 0
-		return b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"})
+		return b.bucket.Upload(ctx, key, movingReader{ctx, n}, &blob.WriterOptions{ContentType: "application/octet-stream"})
 	})
 	if err != nil {
 		return err
@@ -612,7 +612,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	h := sha256.New()
 	var size int64
 	var modTime time.Time
-	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
+	err = b.downloadWithRetry(ctx, func(ctx context.Context) error {
 		rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
 		if err != nil {
 			return err
@@ -635,7 +635,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		h.Reset()
 
 		modTime = rdr.ModTime()
-		size, err = io.Copy(io.MultiWriter(diskWriter{f}, h), rdr)
+		size, err = io.Copy(io.MultiWriter(diskWriter{f}, h), movingReader{ctx, rdr})
 		return err
 	})
 	if gcerrors.Code(err) == gcerrors.NotFound {
