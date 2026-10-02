@@ -95,11 +95,10 @@ func checkedBucket(t *testing.T, underlying *blob.Bucket, dir string) *Bucket {
 			t.Fatal(err)
 		}
 	}
-	b := &Bucket{disk: &Disk{cacheDir: dir}, bucket: underlying}
-	b.remote.marker = remoteDisabledMarker(dir, testRemote)
-	b.Start(context.Background())
-	t.Cleanup(b.Close)
-	return b
+	return startBucket(t, underlying, func(b *Bucket) {
+		b.disk = &Disk{cacheDir: dir}
+		b.remote.marker = remoteDisabledMarker(dir, testRemote)
+	})
 }
 
 var someAction = strings.Repeat("a", 64)
@@ -1264,9 +1263,7 @@ func TestStartup_NoMarkerNoCheck(t *testing.T) {
 	underlying := memblob.OpenBucket(nil)
 	defer underlying.Close()
 
-	b := &Bucket{disk: newDisk(t), bucket: underlying}
-	b.Start(context.Background())
-	defer b.Close()
+	b := startBucket(t, underlying)
 
 	if _, _, err := b.OutputIDFromAction(context.Background(), someAction); err != nil {
 		t.Fatal(err)

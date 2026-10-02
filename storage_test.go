@@ -223,15 +223,24 @@ func TestDiskLinkActionToOutput_RecordsPutTime(t *testing.T) {
 	}
 }
 
-func newBucket(t *testing.T) (*Bucket, *blob.Bucket) {
+// startBucket starts a Bucket on underlying, with a new local cache, and
+// closes it when the test ends. configure, if any, sets more of it first.
+func startBucket(t *testing.T, underlying *blob.Bucket, configure ...func(*Bucket)) *Bucket {
 	t.Helper()
-	d := newDisk(t)
-	underlying := memblob.OpenBucket(nil)
-	t.Cleanup(func() { underlying.Close() })
-	b := &Bucket{disk: d, bucket: underlying}
+	b := &Bucket{disk: newDisk(t), bucket: underlying}
+	for _, c := range configure {
+		c(b)
+	}
 	b.Start(context.Background())
 	t.Cleanup(b.Close)
-	return b, underlying
+	return b
+}
+
+func newBucket(t *testing.T) (*Bucket, *blob.Bucket) {
+	t.Helper()
+	underlying := memblob.OpenBucket(nil)
+	t.Cleanup(func() { underlying.Close() })
+	return startBucket(t, underlying), underlying
 }
 
 func TestBucketPutOutput_PersistsAndUploads(t *testing.T) {
@@ -861,9 +870,7 @@ func TestBucket_BreakerStopsUsingFailingBucket(t *testing.T) {
 	underlying := memblob.OpenBucket(nil)
 	underlying.Close()
 
-	b := &Bucket{disk: d, bucket: underlying}
-	b.Start(ctx)
-	t.Cleanup(b.Close)
+	b := startBucket(t, underlying, func(b *Bucket) { b.disk = d })
 
 	for i := range maxConsecutiveFailures + 3 {
 		_, _, err := b.OutputIDFromAction(ctx, fmt.Sprintf("%064x", i))

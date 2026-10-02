@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"gocloud.dev/blob"
 	"gocloud.dev/blob/gcsblob"
 	"gocloud.dev/blob/memblob"
 	"gocloud.dev/gcp"
@@ -170,53 +169,42 @@ func newFakeGCSBucket(t *testing.T, transport *fakeGCS) *Bucket {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { underlying.Close() })
-
-	b := &Bucket{disk: newDisk(t), bucket: underlying}
-	b.Start(context.Background())
-	t.Cleanup(b.Close)
-	return b
+	return startBucket(t, underlying)
 }
 
-func TestGCS_UploadRecoversFromA503(t *testing.T) {
-	fastRetries(t, 5*time.Second)
-	transport := &fakeGCS{method: http.MethodPost}
-	transport.failures.Store(1)
-	b := newFakeGCSBucket(t, transport)
-
-	content := []byte("output")
-	outputID := hashID(content)
-	if err := os.WriteFile(filepath.Join(b.disk.cacheDir, outputDir, outputID), content, 0o600); err != nil {
-		t.Fatal(err)
+func TestGCS_UploadRetries503s(t *testing.T) {
+	tests := map[string]struct {
+		failures     int64
+		wantErr      bool
+		wantRequests int64 // maxAttempts if zero
+	}{
+		"recovers from one":           {failures: 1, wantRequests: 2},
+		"gives up on persistent ones": {failures: -1, wantErr: true},
 	}
 
-	err := b.withRetry(context.Background(), transferTimeout, func(ctx context.Context) error {
-		return b.bucket.Upload(ctx, "output/"+outputID, bytes.NewReader(content), &blob.WriterOptions{ContentType: "application/octet-stream"})
-	})
-	if err != nil {
-		t.Fatalf("upload: %v", err)
-	}
-	if got := b.stats.Retries.Load(); got != 1 {
-		t.Errorf("retries = %d, want 1", got)
-	}
-	if got := transport.requests.Load(); got != 2 {
-		t.Errorf("requests = %d, want 2", got)
-	}
-}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			fastRetries(t, 5*time.Second)
+			transport := &fakeGCS{method: http.MethodPost}
+			transport.failures.Store(tc.failures)
+			b := newFakeGCSBucket(t, transport)
 
-func TestGCS_UploadGivesUpOnPersistent503s(t *testing.T) {
-	fastRetries(t, 5*time.Second)
-	transport := &fakeGCS{method: http.MethodPost}
-	transport.failures.Store(-1)
-	b := newFakeGCSBucket(t, transport)
+			content := []byte("output")
+			err := b.withRetry(context.Background(), transferTimeout, func(ctx context.Context) error {
+				return b.bucket.Upload(ctx, "output/"+hashID(content), bytes.NewReader(content), outputOptions())
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("upload = %v, want an error: %v", err, tc.wantErr)
+			}
 
-	err := b.withRetry(context.Background(), transferTimeout, func(ctx context.Context) error {
-		return b.bucket.Upload(ctx, "key", bytes.NewReader(nil), &blob.WriterOptions{ContentType: "text/plain"})
-	})
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	if got := transport.requests.Load(); got != int64(maxAttempts) {
-		t.Errorf("requests = %d, want %d", got, maxAttempts)
+			want := cmp.Or(tc.wantRequests, int64(maxAttempts))
+			if got := transport.requests.Load(); got != want {
+				t.Errorf("requests = %d, want %d", got, want)
+			}
+			if got := b.stats.Retries.Load(); got != want-1 {
+				t.Errorf("retries = %d, want %d", got, want-1)
+			}
+		})
 	}
 }
 

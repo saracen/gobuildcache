@@ -38,10 +38,10 @@ func newFileBucket(t *testing.T, readonly bool) (*Bucket, *blob.Bucket, string) 
 	}
 	t.Cleanup(func() { underlying.Close() })
 
-	b := &Bucket{disk: newDisk(t), bucket: underlying, readonly: readonly, refreshAfter: time.Hour}
-	b.Start(context.Background())
-	t.Cleanup(b.Close)
-
+	b := startBucket(t, underlying, func(b *Bucket) {
+		b.readonly = readonly
+		b.refreshAfter = time.Hour
+	})
 	return b, underlying, dir
 }
 
