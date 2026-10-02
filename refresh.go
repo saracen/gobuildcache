@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -145,7 +144,7 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 
 	var r io.ReadSeeker = bytes.NewReader(nil)
 	if job.local != "" {
-		f, err := os.Open(job.local)
+		f, err := openFile(job.local)
 		if err != nil {
 			return fmt.Errorf("opening local copy: %w", err)
 		}

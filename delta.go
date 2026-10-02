@@ -152,7 +152,7 @@ func (d *delta) output(outputID string) (string, bool) {
 		return pathname, true
 	}
 
-	f, err := os.Open(pathname)
+	f, err := openFile(pathname)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", false
 	}
@@ -227,7 +227,7 @@ func writeFileAtomic(dir, name, data string) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(f.Name(), filepath.Join(dir, name))
+	return renameFile(f.Name(), filepath.Join(dir, name))
 }
 
 // readUsed returns when the entry for actionID was last used, or the zero

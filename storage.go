@@ -181,7 +181,7 @@ func (d *Disk) PutOutput(ctx context.Context, outputID string, r io.Reader) (str
 		return "", false, fmt.Errorf("flushing output to disk: %w", err)
 	}
 
-	if err := os.Rename(f.Name(), outputPathname); err != nil {
+	if err := renameContent(f.Name(), outputPathname); err != nil {
 		return "", false, fmt.Errorf("renaming: %w", err)
 	}
 
@@ -232,7 +232,7 @@ func readActionLink(pathname string) (string, time.Time, error) {
 	// Both come from the same open file: a put renames a new link into place,
 	// so reading them separately could pair one put's output with another's
 	// time.
-	f, err := os.Open(pathname)
+	f, err := openFile(pathname)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -287,7 +287,7 @@ func (d *Disk) LinkActionToOutput(ctx context.Context, actionID, outputID string
 		os.Remove(actionPathname)
 	}
 
-	if err := os.Rename(f.Name(), actionPathname); err != nil {
+	if err := renameFile(f.Name(), actionPathname); err != nil {
 		return time.Time{}, err
 	}
 	return previous, nil
@@ -492,7 +492,7 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 		return nil
 	}
 
-	f, err := os.Open(local)
+	f, err := openFile(local)
 	if err != nil {
 		return err
 	}
@@ -649,7 +649,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		return "", fmt.Errorf("output %s hash mismatch: got %s", outputID, got)
 	}
 
-	if err := os.Rename(f.Name(), pathname); err != nil {
+	if err := renameContent(f.Name(), pathname); err != nil {
 		return "", fmt.Errorf("renaming output: %w", err)
 	}
 	keep = true
