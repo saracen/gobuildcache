@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -127,10 +129,11 @@ func TestWithRetry_BoundsCallsThatNeverReturn(t *testing.T) {
 }
 
 // fakeGCS stands in for the Cloud Storage API, failing the first failures
-// requests of the given method with a 503, or all of them if failures is
-// negative.
+// requests of the given method, or of any method if it's empty, with status,
+// or 503 if that's zero, or all of them if failures is negative.
 type fakeGCS struct {
 	method   string
+	status   int
 	failures atomic.Int64
 	requests atomic.Int64
 }
@@ -142,8 +145,9 @@ func (f *fakeGCS) RoundTrip(r *http.Request) (*http.Response, error) {
 		r.Body.Close()
 	}
 
-	if r.Method == f.method && (f.failures.Load() < 0 || f.failures.Add(-1) >= 0) {
-		return &http.Response{StatusCode: http.StatusServiceUnavailable, Status: "503 Service Unavailable", Body: http.NoBody, Request: r}, nil
+	if (f.method == "" || r.Method == f.method) && (f.failures.Load() < 0 || f.failures.Add(-1) >= 0) {
+		status := cmp.Or(f.status, http.StatusServiceUnavailable)
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)), Body: http.NoBody, Request: r}, nil
 	}
 
 	return &http.Response{
@@ -281,5 +285,60 @@ func TestWithRetry_RecordsTiming(t *testing.T) {
 	}
 	if got := b.stats.remoteInFlight.Load(); got != 0 {
 		t.Errorf("in flight after = %d, want 0", got)
+	}
+}
+
+func TestWithRetry_RecordsForTheBreaker(t *testing.T) {
+	fastRetries(t, time.Second)
+	b := &Bucket{}
+
+	for range maxConsecutiveFailures {
+		_ = b.withRetry(context.Background(), time.Second, func(context.Context) error {
+			return errors.New("still broken")
+		})
+	}
+	if b.remote.allow() {
+		t.Error("the breaker should trip after persistently failing calls")
+	}
+}
+
+func TestWithRetry_SupersededWritesSayNothing(t *testing.T) {
+	fastRetries(t, time.Second)
+	b := &Bucket{}
+	b.remote.failures.Store(3)
+
+	var calls int
+	err := b.withRetry(context.Background(), time.Second, func(context.Context) error {
+		calls++
+		return errSuperseded
+	})
+	if !errors.Is(err, errSuperseded) || calls != 1 {
+		t.Errorf("err = %v, calls = %d; want superseded after 1 call", err, calls)
+	}
+	if got := b.remote.failures.Load(); got != 3 {
+		t.Errorf("failures = %d, want 3: a write not made shows nothing about the bucket", got)
+	}
+}
+
+// uploadOutput's lookup of whether the output is there counts towards the
+// breaker, as the upload after it does. A 400 is retried by neither the
+// SDK nor withRetry.
+func TestUploadOutput_LookupCountsTowardsTheBreaker(t *testing.T) {
+	fastRetries(t, 5*time.Second)
+	transport := &fakeGCS{status: http.StatusBadRequest}
+	transport.failures.Store(-1)
+	b := newFakeGCSBucket(t, transport)
+
+	content := []byte("output")
+	outputID := hashID(content)
+	if err := os.WriteFile(filepath.Join(b.disk.cacheDir, outputDir, outputID), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.uploadOutput(context.Background(), outputID); err == nil {
+		t.Fatal("expected the upload to fail")
+	}
+	if got := b.remote.failures.Load(); got != 2 {
+		t.Errorf("failures = %d, want 2: the lookup and the upload", got)
 	}
 }

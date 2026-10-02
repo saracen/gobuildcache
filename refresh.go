@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -100,19 +101,21 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 
 	// write calls op with the key held, unless this process has put it.
 	w := b.keyWrites(job.key)
-	superseded := false
 	write := func(op func() error) error {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 
 		if w.put.Load() {
-			superseded = true
-			return nil
+			return errSuperseded
 		}
 		return op()
 	}
 
-	err := b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
+	// Whether a copy works depends on the provider and the object, as well as
+	// the bucket: Azure refuses to copy a blob onto itself, and S3 an object
+	// over 5 GB. So the copy doesn't count towards the breaker, failing or
+	// succeeding; the upload instead does.
+	err := b.call(ctx, transferTimeout, callOptions{unrecorded: true}, func(ctx context.Context) error {
 		return write(func() error {
 			return b.bucket.Copy(ctx, job.key, job.key, &blob.CopyOptions{
 				BeforeCopy: func(asFunc func(any) bool) error {
@@ -130,12 +133,11 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 			})
 		})
 	})
-	if superseded {
+	if errors.Is(err, errSuperseded) {
 		slog.Debug("refresh superseded by a put", "key", job.key)
 		return nil
 	}
 	if err == nil {
-		b.remote.record(nil)
 		b.stats.Refreshes.Add(1)
 		return nil
 	}
@@ -163,11 +165,10 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 			})
 		})
 	})
-	if superseded {
+	if errors.Is(err, errSuperseded) {
 		slog.Debug("refresh superseded by a put", "key", job.key)
 		return nil
 	}
-	b.remote.record(err)
 	if err != nil {
 		return err
 	}

@@ -553,3 +553,25 @@ func TestRefresh_InFlightFinishesBeforeRePut(t *testing.T) {
 		t.Errorf("bucket link's output = %s, want the rerun's %s", got, rerun)
 	}
 }
+
+// A copy's success shows nothing about calls failing meanwhile, so it
+// doesn't reset the breaker.
+func TestRefresh_CopyDoesNotCountTowardsTheBreaker(t *testing.T) {
+	b, underlying, dir := newFileBucket(t, false)
+	ctx := context.Background()
+
+	content := []byte("copied")
+	outputID := seed(t, underlying, dir, strings.Repeat("a", 64), content, time.Now().Add(-48*time.Hour))
+	b.remote.failures.Store(3)
+
+	key := path.Join(outputDir, outputID)
+	if err := b.refresh(ctx, refreshJob{key: key, contentType: "application/octet-stream"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.stats.Refreshes.Load(); got != 1 {
+		t.Fatalf("refreshes = %d, want 1", got)
+	}
+	if got := b.remote.failures.Load(); got != 3 {
+		t.Errorf("failures = %d, want 3", got)
+	}
+}

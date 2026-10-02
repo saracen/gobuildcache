@@ -332,7 +332,6 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 		attr, err = b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
 		return err
 	})
-	b.remote.record(err)
 	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		slog.Debug("created found", "action", actionID, "output", outputID)
@@ -457,7 +456,6 @@ func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 			ContentType: "text/plain",
 		})
 	})
-	b.remote.record(err)
 	if err != nil {
 		return fmt.Errorf("uploading action %s: %w", job.actionID, err)
 	}
@@ -506,7 +504,6 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 		n.n = 0
 		return b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"})
 	})
-	b.remote.record(err)
 	if err != nil {
 		return err
 	}
@@ -634,7 +631,6 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		size, err = io.Copy(io.MultiWriter(f, h), rdr)
 		return err
 	})
-	b.remote.record(err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
 		return "", nil
 	}
