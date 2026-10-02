@@ -55,9 +55,10 @@ func (b *Bucket) keyWrites(key string) *keyWrites {
 
 // refreshJob refreshes one object in the bucket.
 type refreshJob struct {
-	key         string
-	metadata    map[string]string
-	contentType string
+	key string
+
+	// opts is how the object is written: outputOptions or linkOptions.
+	opts *blob.WriterOptions
 
 	// local is the object's contents on disk, to upload if it can't be
 	// copied. Empty for objects with no contents, such as action links.
@@ -136,8 +137,8 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 					var input *s3.CopyObjectInput
 					if asFunc(&input) {
 						input.MetadataDirective = s3types.MetadataDirectiveReplace
-						input.Metadata = job.metadata
-						input.ContentType = aws.String(job.contentType)
+						input.Metadata = job.opts.Metadata
+						input.ContentType = aws.String(job.opts.ContentType)
 					}
 					return nil
 				},
@@ -176,17 +177,7 @@ func (b *Bucket) refreshByUploading(ctx context.Context, job refreshJob, write f
 		r = f
 	}
 
-	err := b.uploadWithRetry(ctx, func(ctx context.Context) error {
-		return write(func() error {
-			if _, err := r.Seek(0, io.SeekStart); err != nil {
-				return onDisk(err)
-			}
-			return b.bucket.Upload(ctx, job.key, movingReader{ctx, diskReader{r}}, &blob.WriterOptions{
-				Metadata:    job.metadata,
-				ContentType: job.contentType,
-			})
-		})
-	})
+	_, err := b.uploadObject(ctx, job.key, r, job.opts, write)
 	if errors.Is(err, errSuperseded) {
 		slog.Debug("refresh superseded by a put", "key", job.key)
 		return nil

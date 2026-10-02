@@ -359,12 +359,13 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	}
 
 	putTime = unknownPutTime
-	metadata := map[string]string{"output_id": outputID}
+	// refreshing on S3 replaces the metadata, so it must carry the put time
+	// too, as it was
+	refreshedPutTime := ""
 	if v, ok := attr.Metadata[putTimeKey]; ok {
 		if ns, err := strconv.ParseInt(v, 10, 64); err == nil {
 			putTime = time.Unix(0, ns)
-			// refreshing on S3 replaces the metadata, so it must carry this too
-			metadata[putTimeKey] = v
+			refreshedPutTime = v
 		} else {
 			slog.Debug("invalid put time", "action", actionID, "put_time", v)
 		}
@@ -372,9 +373,8 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 
 	if b.shouldRefresh(attr.ModTime) {
 		b.scheduleRefresh(refreshJob{
-			key:         path.Join(actionDir, actionID),
-			metadata:    metadata,
-			contentType: "text/plain",
+			key:  path.Join(actionDir, actionID),
+			opts: linkOptions(outputID, refreshedPutTime),
 		})
 	}
 
@@ -453,13 +453,7 @@ func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 
-		return b.bucket.Upload(ctx, key, bytes.NewReader(nil), &blob.WriterOptions{
-			Metadata: map[string]string{
-				"output_id": job.outputID,
-				putTimeKey:  strconv.FormatInt(job.putTime.UnixNano(), 10),
-			},
-			ContentType: "text/plain",
-		})
+		return b.bucket.Upload(ctx, key, bytes.NewReader(nil), linkOptions(job.outputID, strconv.FormatInt(job.putTime.UnixNano(), 10)))
 	})
 	if err != nil {
 		return fmt.Errorf("uploading action %s: %w", job.actionID, err)
@@ -490,7 +484,7 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 		slog.Debug("output already uploaded", "output", outputID)
 		b.stats.UploadsSkipped.Add(1)
 		if b.shouldRefresh(attrs.ModTime) {
-			b.refreshNow(ctx, refreshJob{key: key, contentType: "application/octet-stream", local: local})
+			b.refreshNow(ctx, refreshJob{key: key, opts: outputOptions(), local: local})
 		}
 		return nil
 	}
@@ -501,22 +495,53 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	}
 	defer f.Close()
 
-	n := &countingReader{r: diskReader{f}}
-	err = b.uploadWithRetry(ctx, func(ctx context.Context) error {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return onDisk(err)
-		}
-		n.n = 0
-		return b.bucket.Upload(ctx, key, movingReader{ctx, n}, &blob.WriterOptions{ContentType: "application/octet-stream"})
-	})
+	n, err := b.uploadObject(ctx, key, f, outputOptions(), nil)
 	if err != nil {
 		return err
 	}
 
 	b.stats.Uploads.Add(1)
-	b.stats.UploadBytes.Add(n.n)
+	b.stats.UploadBytes.Add(n)
 
 	return nil
+}
+
+// outputOptions is how an output is written, by a put or a refresh, so that
+// one refreshed is written as one put is.
+func outputOptions() *blob.WriterOptions {
+	return &blob.WriterOptions{ContentType: "application/octet-stream"}
+}
+
+// linkOptions is how an action link to outputID is written, by a put or a
+// refresh: it's metadata, with putTime, if it's not "", in Unix nanoseconds.
+func linkOptions(outputID, putTime string) *blob.WriterOptions {
+	metadata := map[string]string{"output_id": outputID}
+	if putTime != "" {
+		metadata[putTimeKey] = putTime
+	}
+	return &blob.WriterOptions{Metadata: metadata, ContentType: "text/plain"}
+}
+
+// uploadObject uploads r to key with opts, from r's start on every attempt,
+// and returns how much the attempt that succeeded uploaded. write makes the
+// upload, so that a refresh can hold the key while it does, or nil to just
+// make it.
+func (b *Bucket) uploadObject(ctx context.Context, key string, r io.ReadSeeker, opts *blob.WriterOptions, write func(func() error) error) (int64, error) {
+	if write == nil {
+		write = func(op func() error) error { return op() }
+	}
+
+	var n countingReader
+	err := b.uploadWithRetry(ctx, func(ctx context.Context) error {
+		return write(func() error {
+			if _, err := r.Seek(0, io.SeekStart); err != nil {
+				return onDisk(err)
+			}
+			n = countingReader{r: diskReader{r}}
+			return b.bucket.Upload(ctx, key, movingReader{ctx, &n}, opts)
+		})
+	})
+	return n.n, err
 }
 
 type countingReader struct {
@@ -666,7 +691,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	b.stats.DownloadBytes.Add(size)
 
 	if b.shouldRefresh(modTime) {
-		b.scheduleRefresh(refreshJob{key: path.Join(outputDir, outputID), contentType: "application/octet-stream", local: pathname})
+		b.scheduleRefresh(refreshJob{key: path.Join(outputDir, outputID), opts: outputOptions(), local: pathname})
 	}
 
 	slog.Debug("downloaded to disk", "output", outputID, "size", size)

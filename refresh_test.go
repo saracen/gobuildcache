@@ -278,7 +278,7 @@ func TestRefresh_FallsBackToUploading(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := b.refresh(ctx, refreshJob{key: key, contentType: "application/octet-stream", local: local}); err != nil {
+	if err := b.refresh(ctx, refreshJob{key: key, opts: outputOptions(), local: local}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -572,7 +572,7 @@ func TestRefresh_CopyDoesNotCountTowardsTheBreaker(t *testing.T) {
 	b.remote.failures.Store(3)
 
 	key := path.Join(outputDir, outputID)
-	if err := b.refresh(ctx, refreshJob{key: key, contentType: "application/octet-stream"}); err != nil {
+	if err := b.refresh(ctx, refreshJob{key: key, opts: outputOptions()}); err != nil {
 		t.Fatal(err)
 	}
 	if got := b.stats.Refreshes.Load(); got != 1 {
@@ -602,7 +602,7 @@ func TestRefresh_StopsCopyingOnceCopiesKeepFailing(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := b.refresh(ctx, refreshJob{key: key, contentType: "application/octet-stream", local: local}); err != nil {
+		if err := b.refresh(ctx, refreshJob{key: key, opts: outputOptions(), local: local}); err != nil {
 			t.Fatal(err)
 		}
 	}
