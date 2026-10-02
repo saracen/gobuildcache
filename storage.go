@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gocloud.dev/blob"
@@ -111,6 +112,10 @@ type Bucket struct {
 	refreshAfter time.Duration
 	refreshed    sync.Map // key -> struct{}
 	writes       sync.Map // key -> *keyWrites
+
+	// copyFailures counts the refreshes in a row whose copy failed; see
+	// refresh.
+	copyFailures atomic.Int64
 
 	closeOnce sync.Once
 }

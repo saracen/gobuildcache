@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -293,10 +296,13 @@ type fakeS3 struct {
 	mu   sync.Mutex
 	objs map[string]fakeObject
 
-	// copyStatus fails copies with this status if it's set, and beforeCopy
-	// is called before a copy that isn't failed.
+	// copyStatus fails copies with this status, and copyCode if it's set or
+	// AccessDenied, if it's set, and beforeCopy is called before a copy that
+	// isn't failed. copies counts the copies asked for.
 	copyStatus int
+	copyCode   string
 	beforeCopy func()
+	copies     atomic.Int64
 }
 
 type fakeObject struct {
@@ -331,10 +337,11 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "":
+		f.copies.Add(1)
 		if f.copyStatus != 0 {
 			w.Header().Set("Content-Type", "application/xml")
 			w.WriteHeader(f.copyStatus)
-			io.WriteString(w, `<Error><Code>AccessDenied</Code><Message>copy failed</Message></Error>`)
+			io.WriteString(w, `<Error><Code>`+cmp.Or(f.copyCode, "AccessDenied")+`</Code><Message>copy failed</Message></Error>`)
 			return
 		}
 		if f.beforeCopy != nil {
@@ -573,5 +580,40 @@ func TestRefresh_CopyDoesNotCountTowardsTheBreaker(t *testing.T) {
 	}
 	if got := b.remote.failures.Load(); got != 3 {
 		t.Errorf("failures = %d, want 3", got)
+	}
+}
+
+// A copy the provider refuses, as S3 refuses one of an object over 5 GB, is
+// tried once, uploading being its retry, and once copies keep failing,
+// refreshes upload without asking.
+func TestRefresh_StopsCopyingOnceCopiesKeepFailing(t *testing.T) {
+	fastRetries(t, 5*time.Second)
+	f := &fakeS3{objs: map[string]fakeObject{}, copyStatus: http.StatusBadRequest, copyCode: "InvalidRequest"}
+	b := &Bucket{disk: newDisk(t), bucket: openFakeS3(t, f), refreshAfter: time.Hour}
+	ctx := context.Background()
+
+	const refreshes = maxCopyFailures + 2
+	for i := range refreshes {
+		content := []byte(fmt.Sprintf("output %d", i))
+		key := path.Join(outputDir, hashID(content))
+		f.objs[key] = fakeObject{body: content, modTime: time.Now().Add(-48 * time.Hour)}
+		local := filepath.Join(b.disk.cacheDir, outputDir, hashID(content))
+		if err := os.WriteFile(local, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := b.refresh(ctx, refreshJob{key: key, contentType: "application/octet-stream", local: local}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := f.copies.Load(); got != maxCopyFailures {
+		t.Errorf("copies = %d, want %d: one each, until they keep failing", got, maxCopyFailures)
+	}
+	if got := b.stats.RefreshUploads.Load(); got != refreshes {
+		t.Errorf("refresh uploads = %d, want %d", got, refreshes)
+	}
+	if got := b.remote.failures.Load(); got != 0 {
+		t.Errorf("failures = %d, want 0: refused copies say nothing about the bucket", got)
 	}
 }

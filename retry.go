@@ -111,6 +111,10 @@ type callOptions struct {
 	// failure doesn't show whether the bucket works, nor its success that it
 	// does (see refresh).
 	unrecorded bool
+
+	// once makes the call once, for one whose caller tries something else
+	// when it fails (see refresh).
+	once bool
 }
 
 // call is withRetry, with opts.
@@ -202,7 +206,7 @@ func (b *Bucket) retry(ctx context.Context, timeout time.Duration, opts callOpti
 				b.remote.trip(err)
 			}
 		}
-		if err == nil || !retryable(err) || attempt >= maxAttempts || ctx.Err() != nil || !b.remote.allow() {
+		if err == nil || !retryable(err) || attempt >= maxAttempts || opts.once || ctx.Err() != nil || !b.remote.allow() {
 			return err
 		}
 		// A transfer still moving at its timeout would take as long again. An

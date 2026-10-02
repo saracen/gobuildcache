@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"gocloud.dev/blob"
+	"gocloud.dev/gcerrors"
 )
 
 // Buckets are expected to expire entries some time after they were last
@@ -33,6 +34,10 @@ import (
 // output and put time the rerun replaced. Once an action link has been put,
 // refreshes of it stop, since the put's upload restarts its expiry anyway, and
 // a refresh already writing it finishes before the upload writes it.
+
+// maxCopyFailures is how many refreshes in a row can fail to copy before
+// the rest upload instead.
+const maxCopyFailures = 3
 
 // keyWrites orders this process's writes of one key.
 type keyWrites struct {
@@ -114,8 +119,14 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 	// Whether a copy works depends on the provider and the object, as well as
 	// the bucket: Azure refuses to copy a blob onto itself, and S3 an object
 	// over 5 GB. So the copy doesn't count towards the breaker, failing or
-	// succeeding; the upload instead does.
-	err := b.call(ctx, transferTimeout, callOptions{unrecorded: true}, func(ctx context.Context) error {
+	// succeeding; the upload instead does. It's only tried once, the upload
+	// being its retry, and once copies have failed maxCopyFailures times in a
+	// row, refreshes stop trying them and upload straight away.
+	if b.copyFailures.Load() >= maxCopyFailures {
+		slog.Debug("copies keep failing, refreshing by uploading", "key", job.key)
+		return b.refreshByUploading(ctx, job, write)
+	}
+	err := b.call(ctx, transferTimeout, callOptions{unrecorded: true, once: true}, func(ctx context.Context) error {
 		return write(func() error {
 			return b.bucket.Copy(ctx, job.key, job.key, &blob.CopyOptions{
 				BeforeCopy: func(asFunc func(any) bool) error {
@@ -138,12 +149,23 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 		return nil
 	}
 	if err == nil {
+		b.copyFailures.Store(0)
 		b.stats.Refreshes.Add(1)
 		return nil
 	}
 
+	// an object that's gone, as when it expired first, doesn't show copies
+	// are refused
+	if gcerrors.Code(err) != gcerrors.NotFound {
+		b.copyFailures.Add(1)
+	}
 	slog.Debug("refreshing by copy failed, uploading instead", "key", job.key, "err", err)
+	return b.refreshByUploading(ctx, job, write)
+}
 
+// refreshByUploading refreshes by uploading the object again from the local
+// cache, writing it with write.
+func (b *Bucket) refreshByUploading(ctx context.Context, job refreshJob, write func(func() error) error) error {
 	var r io.ReadSeeker = bytes.NewReader(nil)
 	if job.local != "" {
 		f, err := openFile(job.local)
@@ -154,7 +176,7 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 		r = f
 	}
 
-	err = b.uploadWithRetry(ctx, func(ctx context.Context) error {
+	err := b.uploadWithRetry(ctx, func(ctx context.Context) error {
 		return write(func() error {
 			if _, err := r.Seek(0, io.SeekStart); err != nil {
 				return onDisk(err)
