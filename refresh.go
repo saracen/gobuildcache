@@ -157,9 +157,9 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 	err = b.uploadWithRetry(ctx, func(ctx context.Context) error {
 		return write(func() error {
 			if _, err := r.Seek(0, io.SeekStart); err != nil {
-				return err
+				return onDisk(err)
 			}
-			return b.bucket.Upload(ctx, job.key, r, &blob.WriterOptions{
+			return b.bucket.Upload(ctx, job.key, diskReader{r}, &blob.WriterOptions{
 				Metadata:    job.metadata,
 				ContentType: job.contentType,
 			})

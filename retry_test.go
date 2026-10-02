@@ -46,6 +46,8 @@ func TestRetryable(t *testing.T) {
 		"attempt timed out":       {context.DeadlineExceeded, true},
 		"not found":               {notFound, false},
 		"canceled":                {context.Canceled, false},
+		"local disk":              {onDisk(errors.New("no space left on device")), false},
+		"superseded":              {errSuperseded, false},
 	}
 
 	for name, tc := range tests {
@@ -342,3 +344,28 @@ func TestUploadOutput_LookupCountsTowardsTheBreaker(t *testing.T) {
 		t.Errorf("failures = %d, want 2: the lookup and the upload", got)
 	}
 }
+
+// An error from the local disk, such as running out of space for a
+// download, says nothing about the bucket.
+func TestWithRetry_LocalErrorsSayNothing(t *testing.T) {
+	fastRetries(t, time.Second)
+	b := &Bucket{}
+
+	var calls int
+	err := b.withRetry(context.Background(), time.Second, func(context.Context) error {
+		calls++
+		_, err := io.Copy(diskWriter{failingWriter{}}, strings.NewReader("output"))
+		return err
+	})
+	var l *diskError
+	if !errors.As(err, &l) || calls != 1 {
+		t.Errorf("err = %v, calls = %d; want a local error after 1 call", err, calls)
+	}
+	if got := b.remote.failures.Load(); got != 0 {
+		t.Errorf("failures = %d, want 0", got)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("no space left on device") }

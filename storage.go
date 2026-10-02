@@ -496,10 +496,10 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	}
 	defer f.Close()
 
-	n := &countingReader{r: f}
+	n := &countingReader{r: diskReader{f}}
 	err = b.uploadWithRetry(ctx, func(ctx context.Context) error {
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
+			return onDisk(err)
 		}
 		n.n = 0
 		return b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"})
@@ -614,10 +614,10 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
 		// start again from nothing if a previous attempt failed part way
 		if err := f.Truncate(0); err != nil {
-			return err
+			return onDisk(err)
 		}
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
+			return onDisk(err)
 		}
 		h.Reset()
 
@@ -628,7 +628,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 		defer rdr.Close()
 
 		modTime = rdr.ModTime()
-		size, err = io.Copy(io.MultiWriter(f, h), rdr)
+		size, err = io.Copy(io.MultiWriter(diskWriter{f}, h), rdr)
 		return err
 	})
 	if gcerrors.Code(err) == gcerrors.NotFound {

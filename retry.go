@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"time"
@@ -103,7 +104,45 @@ var errSuperseded = errors.New("superseded by a put")
 // inconclusive reports whether err says nothing about whether the bucket
 // works, so isn't retried, nor counted towards the breaker.
 func inconclusive(err error) bool {
-	return errors.Is(err, errSuperseded)
+	var l *diskError
+	return errors.Is(err, errSuperseded) || errors.As(err, &l)
+}
+
+// diskError is an error from the local disk during a call to the bucket,
+// such as running out of space for a download. gocloud reports it as
+// Unknown, which would otherwise be retried, downloading the output again
+// each time, and counted towards the breaker, turning off a bucket that
+// works over a full disk.
+type diskError struct{ err error }
+
+func (e *diskError) Error() string { return e.err.Error() }
+func (e *diskError) Unwrap() error { return e.err }
+
+// onDisk marks err, if any, as the local disk's.
+func onDisk(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &diskError{err}
+}
+
+// diskWriter marks the errors of writing to a local file.
+type diskWriter struct{ w io.Writer }
+
+func (l diskWriter) Write(p []byte) (int, error) {
+	n, err := l.w.Write(p)
+	return n, onDisk(err)
+}
+
+// diskReader marks the errors of reading a local file, other than its end.
+type diskReader struct{ r io.Reader }
+
+func (l diskReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if err == io.EOF {
+		return n, err
+	}
+	return n, onDisk(err)
 }
 
 // retry is call's loop, taking an attempt that sent its request as reaching
