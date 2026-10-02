@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -460,6 +461,25 @@ func TestBucketGetOutput_NotFound(t *testing.T) {
 	}
 	if got != "" {
 		t.Errorf("got %q, want empty on miss", got)
+	}
+}
+
+// A miss doesn't need the disk, so one that can't be written to, such as a
+// full one, doesn't turn it into an error.
+func TestBucketGetOutput_NotFoundWithoutTheDisk(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory the test can't write to")
+	}
+	ctx := context.Background()
+	b, _ := newBucket(t)
+	if err := os.Chmod(b.disk.cacheDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(b.disk.cacheDir, 0o700) })
+
+	got, err := b.GetOutput(ctx, strings.Repeat("a", 64))
+	if err != nil || got != "" {
+		t.Errorf("GetOutput = %q, %v; want a miss", got, err)
 	}
 }
 

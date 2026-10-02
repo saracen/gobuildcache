@@ -593,15 +593,16 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 
 	slog.Debug("downloading", "output", outputID)
 
-	f, err := createTemp(b.disk.cacheDir, "output")
-	if err != nil {
-		return "", fmt.Errorf("creating temporary output file: %w", err)
-	}
+	// The file is only created once the bucket has the output, so a miss
+	// doesn't touch the disk, nor become an error if the disk is full.
+	var f *os.File
 	keep := false
 	defer func() {
-		f.Close()
-		if !keep {
-			os.Remove(f.Name())
+		if f != nil {
+			f.Close()
+			if !keep {
+				os.Remove(f.Name())
+			}
 		}
 	}()
 
@@ -612,20 +613,26 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	var size int64
 	var modTime time.Time
 	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
-		// start again from nothing if a previous attempt failed part way
-		if err := f.Truncate(0); err != nil {
-			return onDisk(err)
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return onDisk(err)
-		}
-		h.Reset()
-
 		rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
 		if err != nil {
 			return err
 		}
 		defer rdr.Close()
+
+		if f == nil {
+			if f, err = createTemp(b.disk.cacheDir, "output"); err != nil {
+				return onDisk(fmt.Errorf("creating temporary output file: %w", err))
+			}
+		} else {
+			// start again from nothing, as a previous attempt failed part way
+			if err := f.Truncate(0); err != nil {
+				return onDisk(err)
+			}
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				return onDisk(err)
+			}
+		}
+		h.Reset()
 
 		modTime = rdr.ModTime()
 		size, err = io.Copy(io.MultiWriter(diskWriter{f}, h), rdr)
