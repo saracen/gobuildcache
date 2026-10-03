@@ -511,8 +511,13 @@ func init() {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "prune" {
-		os.Exit(pruneMain(os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "prune":
+			os.Exit(pruneMain(os.Args[2:]))
+		case "touch":
+			os.Exit(touchMain(os.Args[2:]))
+		}
 	}
 
 	var prefix string
@@ -531,7 +536,7 @@ func main() {
 	flag.StringVar(&opts.deltaDir, "delta-dir", "", "keep this process's puts in this directory rather than -dir, and look there first; requires -readonly, and can't be used with -expire-others")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "%s [flags] <bucket url>\n%s prune [flags]\n", os.Args[0], os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "%s [flags] <bucket url>\n%s prune [flags]\n%s touch [flags]\n", os.Args[0], os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()

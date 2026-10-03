@@ -42,7 +42,15 @@ Fresh checkouts won't hit the cache if files have new modification times:
 - The go command doesn't cache its index of a directory whose files were just modified.
 - Cached test results record the size and modification time of every file a test opens.
 
-Set every checked-out file's modification time to something stable and in the past, such as a time derived from the file's contents, before running `go`.
+Set every checked-out file's modification time to something stable and in the past, such as a time derived from the file's contents, before running `go`. `gobuildcache touch` does that for a git checkout:
+
+```shell
+gobuildcache touch [-C <dir>] [-repo <path>]...
+```
+
+- Every file git tracks gets a time derived from its blob ID, and every directory one from its tree ID, as Unix seconds before 2020. So each only changes when its contents do, unlike commit times: a shallow clone dates every file it didn't fetch the history of to the oldest commit it fetched, and merged results pipelines check out a new merge commit every time.
+- It touches the whole repository containing `-C`, by default the working directory. Symlinks and submodules are skipped, and tracked files missing from the checkout stay missing.
+- `-repo` gives everything in a repository that git doesn't track, such as one tests clone into the checkout, the time of its `HEAD` commit. It's relative to `-C`, can be repeated, and is skipped if it doesn't exist.
 
 ## merge request deltas
 
