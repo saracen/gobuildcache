@@ -517,6 +517,8 @@ func main() {
 			os.Exit(pruneMain(os.Args[2:]))
 		case "touch":
 			os.Exit(touchMain(os.Args[2:]))
+		case "setup":
+			os.Exit(setupMain(os.Args[2:]))
 		}
 	}
 
@@ -536,7 +538,7 @@ func main() {
 	flag.StringVar(&opts.deltaDir, "delta-dir", "", "keep this process's puts in this directory rather than -dir, and look there first; requires -readonly, and can't be used with -expire-others")
 	flag.Var(&envmap, "env", "remap environment variable (example: GOOGLE_APPLICATION_CREDENTIALS=MY_ENV)")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "%s [flags] <bucket url>\n%s prune [flags]\n%s touch [flags]\n", os.Args[0], os.Args[0], os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "%s [flags] <bucket url>\n%s setup [flags]\n%s prune [flags]\n%s touch [flags]\n", os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -594,15 +596,18 @@ func main() {
 }
 
 // pruneMain runs "gobuildcache prune", which prunes a delta dir; see
-// pruneDelta.
+// pruneDelta, and pruneStarted for -started.
 func pruneMain(args []string) int {
 	flags := flag.NewFlagSet("prune", flag.ContinueOnError)
 	deltaDir := flags.String("delta-dir", "", "the delta directory to prune")
 	usedSince := flags.String("used-since", "", "remove entries not used since this time, in Unix seconds or RFC 3339, such as when the job started, unless none was")
 	maxSize := flags.String("max-size", "", "remove the least recently used entries, after -used-since, until their outputs take at most this size, in bytes or with a KiB, MiB or GiB suffix")
+	started := flags.String("started", "", "the file \"gobuildcache setup\" writes when a job starts using the delta, <delta dir>.started, in place of -used-since: without it the delta is removed, and a delta that can't be pruned, or still takes over twice -max-size on disk, is emptied")
+	failed := flags.Bool("failed", false, "with -started, the job failed, and may not have used everything it needs from the delta, so only -max-size applies")
+	ci := flags.String("ci", "", "with -started, take -failed from this CI system's job status: gitlab")
 	verbose := flags.Bool("v", false, "verbose")
 	flags.Usage = func() {
-		fmt.Fprintf(flags.Output(), "%s prune -delta-dir <dir> [-used-since <time>] [-max-size <size>]\n", os.Args[0])
+		fmt.Fprintf(flags.Output(), "%s prune -delta-dir <dir> [-used-since <time> | -started <file> [-failed | -ci gitlab]] [-max-size <size>]\n", os.Args[0])
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -629,9 +634,19 @@ func pruneMain(args []string) int {
 			return 2
 		}
 	}
-	if *deltaDir == "" || flags.NArg() != 0 || (opts.usedSince.IsZero() && opts.maxSize == 0) {
+	switch {
+	case *deltaDir == "" || flags.NArg() != 0,
+		*started == "" && opts.usedSince.IsZero() && opts.maxSize == 0,
+		*started != "" && *usedSince != "",
+		*started == "" && (*failed || *ci != ""),
+		*ci != "" && *ci != "gitlab":
 		flags.Usage()
 		return 2
+	}
+
+	if *started != "" {
+		jobFailed := *failed || *ci == "gitlab" && os.Getenv("CI_JOB_STATUS") != "success"
+		return pruneStarted(*deltaDir, *started, jobFailed, opts)
 	}
 
 	result, err := pruneDelta(*deltaDir, opts)
@@ -639,12 +654,16 @@ func pruneMain(args []string) int {
 		slog.Error("prune", "err", err)
 		return 1
 	}
+	reportPrune(result)
+	return 0
+}
+
+func reportPrune(result pruneResult) {
 	if result.Unused {
-		slog.Warn("gobuildcache prune: no entry was used since -used-since, so the job's go commands didn't use the delta; only -max-size applied")
+		slog.Warn("gobuildcache prune: no entry was used since the job started, so its go commands didn't use the delta; only -max-size applied")
 	}
 	if result.Failed > 0 {
 		slog.Warn("gobuildcache prune: couldn't remove some of the delta's files, such as ones another user owns, so they stay in it when it's saved", "failed", result.Failed, "err", result.Err)
 	}
 	slog.Info("gobuildcache prune", "kept", result.Kept, "kept_bytes", result.KeptBytes, "removed", result.Removed, "removed_bytes", result.RemovedBytes)
-	return 0
 }
