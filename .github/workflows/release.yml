@@ -1,11 +1,10 @@
-# Builds gobuildcache's binaries the way gitlab-runner's CI builds them, so
-# their SHA-256s are the ones it pins (see scripts/gobuildcache in
-# gitlab-org/gitlab-runner): with the official toolchain from the
-# golang.org/toolchain module, by go install of the module version from the
-# module proxy, with CGO_ENABLED=0, -trimpath and -ldflags="-s -w", in an
-# empty directory, with empty caches and none of the runner's Go settings.
-# Builds are reproducible, so anyone can check a release's checksums by
-# building it the same way, without trusting this workflow.
+# Builds gobuildcache's binaries reproducibly: with the official toolchain
+# from the golang.org/toolchain module, by go install of the module version
+# from the module proxy, with CGO_ENABLED=0, -trimpath and -ldflags="-s -w",
+# in an empty directory, with empty caches and none of the runner's Go
+# settings. So anyone can check a release's checksums by building it the same
+# way, without trusting this workflow, and CI configurations that download a
+# release, such as gitlab-runner's, pin them.
 #
 # A tag publishes a release with the binaries and SHA256SUMS. A push that
 # changes this file only builds its commit, and reports the checksums as
