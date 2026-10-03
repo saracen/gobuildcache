@@ -10,12 +10,15 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"gocloud.dev/blob"
 	"gocloud.dev/blob/memblob"
 )
 
@@ -37,20 +40,89 @@ func TestFlagArray(t *testing.T) {
 
 func newCacher(t *testing.T) *Cacher {
 	t.Helper()
-	dir := t.TempDir()
+	underlying := memblob.OpenBucket(nil)
+	t.Cleanup(func() { underlying.Close() })
+	return newCacherOn(t, underlying)
+}
+
+// newCacherOn returns a Cacher with its own local cache, using underlying.
+func newCacherOn(t *testing.T, underlying *blob.Bucket) *Cacher {
+	t.Helper()
+	return newCacherIn(t, underlying, t.TempDir())
+}
+
+// newCacherIn returns a Cacher using underlying and the local cache in dir,
+// as each process sharing dir has.
+func newCacherIn(t *testing.T, underlying *blob.Bucket, dir string) *Cacher {
+	t.Helper()
 	for _, sub := range []string{actionDir, outputDir} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	underlying := memblob.OpenBucket(nil)
-	t.Cleanup(func() { underlying.Close() })
 
 	c := &Cacher{disk: &Disk{cacheDir: dir}}
 	c.bucket = &Bucket{disk: c.disk, bucket: underlying}
 	c.bucket.Start(context.Background())
 	t.Cleanup(c.bucket.Close)
 	return c
+}
+
+func TestReadTestExpire(t *testing.T) {
+	expire := time.Unix(1700000000, 123)
+
+	for _, tc := range []struct {
+		name    string
+		gocache func(t *testing.T) string
+		want    time.Time
+	}{
+		{
+			name: "written by go clean -testcache",
+			gocache: func(t *testing.T) string {
+				return gocacheWith(t, strconv.FormatInt(expire.UnixNano(), 10)+"\n")
+			},
+			want: expire,
+		},
+		{
+			name:    "never cleaned",
+			gocache: func(t *testing.T) string { return t.TempDir() },
+		},
+		{
+			name: "partly written",
+			gocache: func(t *testing.T) string {
+				return gocacheWith(t, strconv.FormatInt(expire.UnixNano(), 10))
+			},
+		},
+		{
+			name:    "malformed",
+			gocache: func(t *testing.T) string { return gocacheWith(t, "soon\n") },
+		},
+		{
+			name:    "GOCACHE unset",
+			gocache: func(t *testing.T) string { return "" },
+		},
+		{
+			name:    "GOCACHE off",
+			gocache: func(t *testing.T) string { return "off" },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GOCACHE", tc.gocache(t))
+			if got := readTestExpire(); !got.Equal(tc.want) {
+				t.Errorf("readTestExpire() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func gocacheWith(t *testing.T, testexpire string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "testexpire.txt"), []byte(testexpire), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func TestCacher_PutGetRoundTrip(t *testing.T) {
@@ -76,7 +148,7 @@ func TestCacher_PutGetRoundTrip(t *testing.T) {
 		t.Errorf("on-disk content mismatch")
 	}
 
-	got, err := c.Get(ctx, &request{ActionID: actionID})
+	got, _, err := c.Get(ctx, &request{ActionID: actionID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +161,7 @@ func TestCacher_GetMiss(t *testing.T) {
 	ctx := context.Background()
 	c := newCacher(t)
 
-	got, err := c.Get(ctx, &request{ActionID: bytes.Repeat([]byte{0xab}, 32)})
+	got, _, err := c.Get(ctx, &request{ActionID: bytes.Repeat([]byte{0xab}, 32)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,9 +188,6 @@ func TestPopulateFileInfo(t *testing.T) {
 		}
 		if resp.Size != int64(len(content)) {
 			t.Errorf("Size=%d, want %d", resp.Size, len(content))
-		}
-		if resp.Time == nil {
-			t.Error("Time was nil")
 		}
 		if len(resp.OutputID) != 32 {
 			t.Errorf("OutputID len=%d, want 32", len(resp.OutputID))
@@ -192,6 +261,269 @@ func TestHandleRequest_Get(t *testing.T) {
 	}
 	if resp.Size != int64(len(content)) {
 		t.Errorf("Size=%d, want %d", resp.Size, len(content))
+	}
+}
+
+func TestHandleRequest_GetReportsPutTime(t *testing.T) {
+	ctx := context.Background()
+	underlying := memblob.OpenBucket(nil)
+	t.Cleanup(func() { underlying.Close() })
+
+	content := []byte("test result")
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+	get := &request{ID: 1, Command: cmdGet, ActionID: actionID}
+
+	writer := newCacherOn(t, underlying)
+	before := time.Now()
+	if resp := handleRequest(ctx, writer, &request{
+		ID: 2, Command: cmdPut, ActionID: actionID, OutputID: sha256Bytes(content),
+		Body: bytes.NewReader(content), BodySize: int64(len(content)),
+	}); resp.Err != "" {
+		t.Fatal(resp.Err)
+	}
+	after := time.Now()
+	writer.bucket.Close()
+
+	local := handleRequest(ctx, writer, get)
+	if local.Miss || local.Time == nil {
+		t.Fatalf("local get = %+v", local)
+	}
+	if local.Time.Before(before.Add(-time.Second)) || local.Time.After(after) {
+		t.Errorf("local get Time = %v, want the put, between %v and %v", local.Time, before, after)
+	}
+
+	// Another machine gets it from the bucket, and must see when it was put,
+	// not when it was downloaded, or "go clean -testcache" can't expire it.
+	time.Sleep(10 * time.Millisecond)
+	reader := newCacherOn(t, underlying)
+	remote := handleRequest(ctx, reader, get)
+	if remote.Miss || remote.Err != "" || remote.Time == nil {
+		t.Fatalf("remote get = %+v", remote)
+	}
+	if !remote.Time.Equal(*local.Time) {
+		t.Errorf("remote get Time = %v, want the put time %v", remote.Time, local.Time)
+	}
+
+	// and so do later gets, from its local cache
+	if again := handleRequest(ctx, reader, get); again.Time == nil || !again.Time.Equal(*local.Time) {
+		t.Errorf("second remote get Time = %v, want %v", again.Time, local.Time)
+	}
+}
+
+// TestHandleRequest_GetFromBucketWithoutLocalLink checks that a bucket hit
+// whose action link can't be kept locally is still a hit, put when the bucket
+// says. Writing the local link is only an optimisation for later gets.
+func TestHandleRequest_GetFromBucketWithoutLocalLink(t *testing.T) {
+	ctx := context.Background()
+	underlying := memblob.OpenBucket(nil)
+	t.Cleanup(func() { underlying.Close() })
+
+	content := []byte("test result")
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+	putTime := time.Unix(1700000000, 0)
+	if err := underlying.WriteAll(ctx, path.Join(outputDir, hashID(content)), content, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := underlying.WriteAll(ctx, path.Join(actionDir, hex.EncodeToString(actionID)), nil, &blob.WriterOptions{
+		Metadata: map[string]string{"output_id": hashID(content), putTimeKey: strconv.FormatInt(putTime.UnixNano(), 10)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// without its action directory, the reader can't write action links
+	reader := newCacherOn(t, underlying)
+	if err := os.RemoveAll(filepath.Join(reader.disk.cacheDir, actionDir)); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := handleRequest(ctx, reader, &request{ID: 1, Command: cmdGet, ActionID: actionID})
+	if resp.Miss || resp.Err != "" || resp.Time == nil || !resp.Time.Equal(putTime) {
+		t.Fatalf("get = %+v, want a hit put at %v", resp, putTime)
+	}
+	if hits, errs := reader.bucket.stats.Hits.Load(), reader.bucket.stats.GetErrors.Load(); hits != 1 || errs != 0 {
+		t.Errorf("hits=%d get_errors=%d, want 1 and 0", hits, errs)
+	}
+}
+
+// TestHandleRequest_GetTimeMatchesOutput checks that a get reports the put
+// time of the output it returns while another process sharing the local cache
+// relinks the action. Pairing an output put before a "go clean -testcache"
+// with a later put time would replay a result that should rerun.
+func TestHandleRequest_GetTimeMatchesOutput(t *testing.T) {
+	ctx := context.Background()
+	c := newCacher(t)
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+
+	// two outputs of the same action, put at different times
+	putTimes := map[string]time.Time{}
+	var outputIDs []string
+	for i, content := range []string{"first", "second"} {
+		resp := handleRequest(ctx, c, &request{
+			ID: int64(i), Command: cmdPut, ActionID: actionID, OutputID: sha256Bytes([]byte(content)),
+			Body: strings.NewReader(content), BodySize: int64(len(content)),
+		})
+		if resp.Err != "" {
+			t.Fatal(resp.Err)
+		}
+		outputID := hashID([]byte(content))
+		outputIDs = append(outputIDs, outputID)
+		putTimes[outputID] = time.Unix(1700000000+int64(i)*3600, 0)
+	}
+	if _, err := c.disk.LinkActionToOutput(ctx, hex.EncodeToString(actionID), outputIDs[0], putTimes[outputIDs[0]]); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	relinked := make(chan error, 1)
+	go func() {
+		defer close(relinked)
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			outputID := outputIDs[i%2]
+			if _, err := c.disk.LinkActionToOutput(ctx, hex.EncodeToString(actionID), outputID, putTimes[outputID]); err != nil {
+				relinked <- err
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(done)
+		if err := <-relinked; err != nil {
+			t.Errorf("relinking: %v", err)
+		}
+	}()
+
+	for i := 0; i < 2000; i++ {
+		resp := handleRequest(ctx, c, &request{ID: 1, Command: cmdGet, ActionID: actionID})
+		if resp.Miss || resp.Err != "" || resp.Time == nil {
+			t.Fatalf("get = %+v", resp)
+		}
+		outputID := hex.EncodeToString(resp.OutputID)
+		if want := putTimes[outputID]; !resp.Time.Equal(want) {
+			t.Fatalf("get %d returned output %s with put time %v, want %v", i, outputID, resp.Time, want)
+		}
+	}
+}
+
+// TestHandleRequest_ExpireOthers checks that with -expire-others, a get
+// reports the put time of an entry this process put, and of every other entry
+// wherever it's from, unknownPutTime, which "go clean -testcache" expires.
+func TestHandleRequest_ExpireOthers(t *testing.T) {
+	ctx := context.Background()
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+	get := &request{ID: 1, Command: cmdGet, ActionID: actionID}
+
+	// put puts content for actionID with c, returning when it was put.
+	put := func(t *testing.T, c *Cacher, content string) (time.Time, time.Time) {
+		t.Helper()
+		before := time.Now()
+		if resp := handleRequest(ctx, c, &request{
+			ID: 2, Command: cmdPut, ActionID: actionID, OutputID: sha256Bytes([]byte(content)),
+			Body: strings.NewReader(content), BodySize: int64(len(content)),
+		}); resp.Err != "" {
+			t.Fatal(resp.Err)
+		}
+		return before, time.Now()
+	}
+
+	for _, tc := range []struct {
+		name string
+		// run puts and gets entries for actionID with self, a process using
+		// underlying and the local cache in dir, and others, returning what
+		// self's last get should get and whether it's self's put, between
+		// before and after.
+		run func(t *testing.T, self *Cacher, underlying *blob.Bucket, dir string) (content string, own bool, before, after time.Time)
+	}{
+		{
+			name: "put by this process",
+			run: func(t *testing.T, self *Cacher, _ *blob.Bucket, _ string) (string, bool, time.Time, time.Time) {
+				before, after := put(t, self, "ours")
+				return "ours", true, before, after
+			},
+		},
+		{
+			name: "put by this process, readonly",
+			run: func(t *testing.T, self *Cacher, underlying *blob.Bucket, _ string) (string, bool, time.Time, time.Time) {
+				self.bucket.readonly = true
+				before, after := put(t, self, "ours")
+				self.bucket.Close()
+				if ok, err := underlying.Exists(ctx, path.Join(actionDir, hex.EncodeToString(actionID))); ok || err != nil {
+					t.Errorf("readonly put uploaded its action link: %v, %v", ok, err)
+				}
+				return "ours", true, before, after
+			},
+		},
+		{
+			name: "from the bucket, put by another job",
+			run: func(t *testing.T, _ *Cacher, underlying *blob.Bucket, _ string) (string, bool, time.Time, time.Time) {
+				other := newCacherOn(t, underlying)
+				put(t, other, "theirs")
+				other.bucket.Close()
+				return "theirs", false, time.Time{}, time.Time{}
+			},
+		},
+		{
+			name: "from the local cache, put by an earlier process",
+			run: func(t *testing.T, _ *Cacher, underlying *blob.Bucket, dir string) (string, bool, time.Time, time.Time) {
+				put(t, newCacherIn(t, underlying, dir), "theirs")
+				return "theirs", false, time.Time{}, time.Time{}
+			},
+		},
+		{
+			name: "put by another process sharing the local cache after this one",
+			run: func(t *testing.T, self *Cacher, underlying *blob.Bucket, dir string) (string, bool, time.Time, time.Time) {
+				put(t, self, "ours")
+				put(t, newCacherIn(t, underlying, dir), "theirs")
+				return "theirs", false, time.Time{}, time.Time{}
+			},
+		},
+		{
+			name: "put by this process after another's",
+			run: func(t *testing.T, self *Cacher, underlying *blob.Bucket, dir string) (string, bool, time.Time, time.Time) {
+				put(t, newCacherIn(t, underlying, dir), "theirs")
+				if resp := handleRequest(ctx, self, get); resp.Miss || resp.Time == nil || !resp.Time.Equal(unknownPutTime) {
+					t.Fatalf("get before rerunning = %+v, want a hit put at %v", resp, unknownPutTime)
+				}
+				before, after := put(t, self, "ours")
+				return "ours", true, before, after
+			},
+		},
+		{
+			name: "put by this process and another sharing the local cache, the same",
+			run: func(t *testing.T, self *Cacher, underlying *blob.Bucket, dir string) (string, bool, time.Time, time.Time) {
+				before, _ := put(t, self, "same")
+				_, after := put(t, newCacherIn(t, underlying, dir), "same")
+				return "same", true, before, after
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			underlying := memblob.OpenBucket(nil)
+			t.Cleanup(func() { underlying.Close() })
+			dir := t.TempDir()
+			self := newCacherIn(t, underlying, dir)
+			self.expireOthers = true
+
+			content, own, before, after := tc.run(t, self, underlying, dir)
+
+			resp := handleRequest(ctx, self, get)
+			if resp.Miss || resp.Err != "" || resp.Time == nil {
+				t.Fatalf("get = %+v, want a hit", resp)
+			}
+			if got := hex.EncodeToString(resp.OutputID); got != hashID([]byte(content)) {
+				t.Fatalf("get returned output %s, want %s's, %s", got, content, hashID([]byte(content)))
+			}
+			switch {
+			case !own && !resp.Time.Equal(unknownPutTime):
+				t.Errorf("get Time = %v, want %v for an entry another process put", resp.Time, unknownPutTime)
+			case own && (resp.Time.Before(before.Add(-time.Second)) || resp.Time.After(after)):
+				t.Errorf("get Time = %v, want this process's put, between %v and %v", resp.Time, before, after)
+			}
+		})
 	}
 }
 

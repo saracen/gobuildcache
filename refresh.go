@@ -3,16 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"gocloud.dev/blob"
+	"gocloud.dev/gcerrors"
 )
 
 // Buckets are expected to expire entries some time after they were last
@@ -25,11 +28,37 @@ import (
 // transferring the object. If the copy fails, the object is uploaded again from
 // the local cache instead.
 
+// A refresh writes back what the object held when it was read, so for an
+// action link it must not land after this process has put the link since,
+// such as for a test rerun after "go clean -testcache": it would restore the
+// output and put time the rerun replaced. Once an action link has been put,
+// refreshes of it stop, since the put's upload restarts its expiry anyway, and
+// a refresh already writing it finishes before the upload writes it.
+
+// maxCopyFailures is how many refreshes in a row can fail to copy before
+// the rest upload instead.
+const maxCopyFailures = 3
+
+// keyWrites orders this process's writes of one key.
+type keyWrites struct {
+	// mu is held while writing the key.
+	mu sync.Mutex
+
+	// put is set once this process has put the key.
+	put atomic.Bool
+}
+
+func (b *Bucket) keyWrites(key string) *keyWrites {
+	v, _ := b.writes.LoadOrStore(key, &keyWrites{})
+	return v.(*keyWrites)
+}
+
 // refreshJob refreshes one object in the bucket.
 type refreshJob struct {
-	key         string
-	metadata    map[string]string
-	contentType string
+	key string
+
+	// opts is how the object is written: outputOptions or linkOptions.
+	opts *blob.WriterOptions
 
 	// local is the object's contents on disk, to upload if it can't be
 	// copied. Empty for objects with no contents, such as action links.
@@ -72,34 +101,75 @@ func (b *Bucket) refreshNow(ctx context.Context, job refreshJob) {
 }
 
 func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
-	if !b.remote.allow() {
+	if !b.useRemote() {
 		return nil
 	}
 
-	err := b.bucket.Copy(ctx, job.key, job.key, &blob.CopyOptions{
-		BeforeCopy: func(asFunc func(any) bool) error {
-			// S3 refuses to copy an object onto itself unless something about
-			// it changes, so have it replace the metadata, with the same.
-			var input *s3.CopyObjectInput
-			if asFunc(&input) {
-				input.MetadataDirective = s3types.MetadataDirectiveReplace
-				input.Metadata = job.metadata
-				input.ContentType = aws.String(job.contentType)
-			}
-			return nil
-		},
+	// write calls op with the key held, unless this process has put it.
+	w := b.keyWrites(job.key)
+	write := func(op func() error) error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		if w.put.Load() {
+			return errSuperseded
+		}
+		return op()
+	}
+
+	// Whether a copy works depends on the provider and the object, as well as
+	// the bucket: Azure refuses to copy a blob onto itself, and S3 an object
+	// over 5 GB. So the copy doesn't count towards the breaker, failing or
+	// succeeding; the upload instead does. It's only tried once, the upload
+	// being its retry, and once copies have failed maxCopyFailures times in a
+	// row, refreshes stop trying them and upload straight away.
+	if b.copyFailures.Load() >= maxCopyFailures {
+		slog.Debug("copies keep failing, refreshing by uploading", "key", job.key)
+		return b.refreshByUploading(ctx, job, write)
+	}
+	err := b.call(ctx, transferTimeout, callOptions{unrecorded: true, once: true}, func(ctx context.Context) error {
+		return write(func() error {
+			return b.bucket.Copy(ctx, job.key, job.key, &blob.CopyOptions{
+				BeforeCopy: func(asFunc func(any) bool) error {
+					// S3 refuses to copy an object onto itself unless
+					// something about it changes, so have it replace the
+					// metadata, with the same.
+					var input *s3.CopyObjectInput
+					if asFunc(&input) {
+						input.MetadataDirective = s3types.MetadataDirectiveReplace
+						input.Metadata = job.opts.Metadata
+						input.ContentType = aws.String(job.opts.ContentType)
+					}
+					return nil
+				},
+			})
+		})
 	})
+	if errors.Is(err, errSuperseded) {
+		slog.Debug("refresh superseded by a put", "key", job.key)
+		return nil
+	}
 	if err == nil {
-		b.remote.record(nil)
+		b.copyFailures.Store(0)
 		b.stats.Refreshes.Add(1)
 		return nil
 	}
 
+	// an object that's gone, as when it expired first, doesn't show copies
+	// are refused
+	if gcerrors.Code(err) != gcerrors.NotFound {
+		b.copyFailures.Add(1)
+	}
 	slog.Debug("refreshing by copy failed, uploading instead", "key", job.key, "err", err)
+	return b.refreshByUploading(ctx, job, write)
+}
 
-	var r io.Reader = bytes.NewReader(nil)
+// refreshByUploading refreshes by uploading the object again from the local
+// cache, writing it with write.
+func (b *Bucket) refreshByUploading(ctx context.Context, job refreshJob, write func(func() error) error) error {
+	var r io.ReadSeeker = bytes.NewReader(nil)
 	if job.local != "" {
-		f, err := os.Open(job.local)
+		f, err := openFile(job.local)
 		if err != nil {
 			return fmt.Errorf("opening local copy: %w", err)
 		}
@@ -107,11 +177,11 @@ func (b *Bucket) refresh(ctx context.Context, job refreshJob) error {
 		r = f
 	}
 
-	err = b.bucket.Upload(ctx, job.key, r, &blob.WriterOptions{
-		Metadata:    job.metadata,
-		ContentType: job.contentType,
-	})
-	b.remote.record(err)
+	_, err := b.uploadObject(ctx, job.key, r, job.opts, write)
+	if errors.Is(err, errSuperseded) {
+		slog.Debug("refresh superseded by a put", "key", job.key)
+		return nil
+	}
 	if err != nil {
 		return err
 	}
