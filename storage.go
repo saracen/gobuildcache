@@ -251,7 +251,12 @@ func (b *Bucket) OutputIDFromAction(ctx context.Context, actionID string) (strin
 	}
 
 	b.stats.RemoteLookups.Add(1)
-	attr, err := b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
+	var attr *blob.Attributes
+	err = b.withRetry(ctx, metadataTimeout, func(ctx context.Context) error {
+		var err error
+		attr, err = b.bucket.Attributes(ctx, path.Join(actionDir, actionID))
+		return err
+	})
 	b.remote.record(err)
 	slog.Debug("fetched attributes", "action", actionID, "output", outputID, "err", err)
 	if gcerrors.Code(err) == gcerrors.NotFound {
@@ -336,9 +341,11 @@ func (b *Bucket) upload(ctx context.Context, job uploadJob) error {
 		return fmt.Errorf("uploading output %s: %w", job.outputID, u.err)
 	}
 
-	err := b.bucket.Upload(ctx, path.Join(actionDir, job.actionID), bytes.NewReader(nil), &blob.WriterOptions{
-		Metadata:    map[string]string{"output_id": job.outputID},
-		ContentType: "text/plain",
+	err := b.withRetry(ctx, metadataTimeout, func(ctx context.Context) error {
+		return b.bucket.Upload(ctx, path.Join(actionDir, job.actionID), bytes.NewReader(nil), &blob.WriterOptions{
+			Metadata:    map[string]string{"output_id": job.outputID},
+			ContentType: "text/plain",
+		})
 	})
 	b.remote.record(err)
 	if err != nil {
@@ -357,7 +364,12 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	// Writers mostly produce outputs that another job has already uploaded;
 	// checking first is a lot cheaper than uploading it again, and it only
 	// needs refreshing if it's getting old.
-	attrs, err := b.bucket.Attributes(ctx, key)
+	var attrs *blob.Attributes
+	err := b.withRetry(ctx, metadataTimeout, func(ctx context.Context) error {
+		var err error
+		attrs, err = b.bucket.Attributes(ctx, key)
+		return err
+	})
 	if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
 		slog.Debug("checking output exists", "output", outputID, "err", err)
 	}
@@ -377,7 +389,13 @@ func (b *Bucket) uploadOutput(ctx context.Context, outputID string) error {
 	defer f.Close()
 
 	n := &countingReader{r: f}
-	err = b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"})
+	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		n.n = 0
+		return b.bucket.Upload(ctx, key, n, &blob.WriterOptions{ContentType: "application/octet-stream"})
+	})
 	b.remote.record(err)
 	if err != nil {
 		return err
@@ -468,16 +486,6 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 
 	slog.Debug("downloading", "output", outputID)
 
-	rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
-	b.remote.record(err)
-	if gcerrors.Code(err) == gcerrors.NotFound {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	defer rdr.Close()
-
 	f, err := os.CreateTemp(b.disk.cacheDir, "output")
 	if err != nil {
 		return "", fmt.Errorf("creating temporary output file: %w", err)
@@ -494,7 +502,32 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	// Hash while streaming so a poisoned bucket can't feed mismatched bytes
 	// into the build.
 	h := sha256.New()
-	size, err := io.Copy(io.MultiWriter(f, h), rdr)
+	var size int64
+	var modTime time.Time
+	err = b.withRetry(ctx, transferTimeout, func(ctx context.Context) error {
+		// start again from nothing if a previous attempt failed part way
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		h.Reset()
+
+		rdr, err := b.bucket.NewReader(ctx, path.Join(outputDir, outputID), nil)
+		if err != nil {
+			return err
+		}
+		defer rdr.Close()
+
+		modTime = rdr.ModTime()
+		size, err = io.Copy(io.MultiWriter(f, h), rdr)
+		return err
+	})
+	b.remote.record(err)
+	if gcerrors.Code(err) == gcerrors.NotFound {
+		return "", nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("downloading output: %w", err)
 	}
@@ -514,7 +547,7 @@ func (b *Bucket) GetOutput(ctx context.Context, outputID string) (string, error)
 	b.stats.Downloads.Add(1)
 	b.stats.DownloadBytes.Add(size)
 
-	if b.shouldRefresh(rdr.ModTime()) {
+	if b.shouldRefresh(modTime) {
 		b.scheduleRefresh(refreshJob{key: path.Join(outputDir, outputID), contentType: "application/octet-stream", local: pathname})
 	}
 

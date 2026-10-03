@@ -39,6 +39,12 @@ Fresh checkouts won't hit the cache if files have new modification times:
 
 Set every checked-out file's modification time to something stable and in the past, such as a time derived from the file's contents, before running `go`.
 
+## retries and timeouts
+
+Every bucket call is bounded and retried the same way whichever provider is behind it: up to 3 attempts with backoff, each limited to 30 seconds for lookups and small writes, or 5 minutes for transferring an output. The limit also bounds retries done inside a provider's SDK, which for some reads otherwise continue until their context ends.
+
+gocloud reports most server errors and throttling (a GCS 503, most S3 and Azure errors) as `Unknown`, so `Unknown` errors are retried, along with `Internal`, `ResourceExhausted` and timeouts. Some permanent errors are `Unknown` too, such as a malformed credentials file, and are retried as well before gobuildcache gives up on the bucket. Errors that can't change, such as not found or permission denied, are not retried.
+
 ## expiring old entries
 
 gobuildcache never deletes anything. Use the storage provider's lifecycle rules to delete entries a number of days after they were last written, for both the `action/` and `output/` prefixes (under `-p`, if you use one):

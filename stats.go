@@ -33,6 +33,10 @@ type Stats struct {
 	Refreshes      atomic.Int64
 	RefreshUploads atomic.Int64
 	RefreshErrors  atomic.Int64
+
+	// Retries counts bucket calls tried again after a possibly transient
+	// error.
+	Retries atomic.Int64
 }
 
 func (s *Stats) Log() {
@@ -54,5 +58,6 @@ func (s *Stats) Log() {
 		"refreshes", s.Refreshes.Load(),
 		"refresh_uploads", s.RefreshUploads.Load(),
 		"refresh_errors", s.RefreshErrors.Load(),
+		"retries", s.Retries.Load(),
 	)
 }
