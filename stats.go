@@ -49,6 +49,14 @@ type Stats struct {
 	RemotePeakInFlight  atomic.Int64
 	remoteInFlight      atomic.Int64
 
+	// ClaimWaits counts misses that waited for another process computing the
+	// same action, ClaimHits those that then got a hit, and ClaimTimeouts
+	// those that gave up waiting.
+	ClaimWaits      atomic.Int64
+	ClaimWaitMillis atomic.Int64
+	ClaimHits       atomic.Int64
+	ClaimTimeouts   atomic.Int64
+
 	// Started is when the process started, for its running time.
 	Started time.Time
 }
@@ -83,5 +91,9 @@ func (s *Stats) Log() {
 		"remote_wait_ms", s.RemoteWaitMillis.Load(),
 		"remote_slowest_ms", s.RemoteSlowestMillis.Load(),
 		"remote_peak_in_flight", s.RemotePeakInFlight.Load(),
+		"claim_waits", s.ClaimWaits.Load(),
+		"claim_wait_ms", s.ClaimWaitMillis.Load(),
+		"claim_hits", s.ClaimHits.Load(),
+		"claim_timeouts", s.ClaimTimeouts.Load(),
 	)
 }
