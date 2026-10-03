@@ -116,6 +116,15 @@ test:
 
 GitLab saves the cache after `after_script`, which runs even when the job fails, and doesn't save one with no files, as in pipelines without `-delta-dir`. Add `.gobuildcache/` to `.gitignore`: the go command stamps binaries built in a checkout with untracked files as modified.
 
+## tests with inputs the go command can't see
+
+The go command reuses a test's cached result while the test binary and what the test recorded are unchanged: the environment variables it looked up, and the size and modification time of the files and directories it opened or changed into. It only records what the test process does itself, through the `os` package, once `m.Run` starts, and only rechecks files inside the module. So it can't see what a test runs that was built elsewhere, such as a binary `TestMain` builds, a program built from `testdata`, or a container image, and when that changes and nothing it recorded does, it replays the old result. That's how the go command's own cache works, wherever it's kept; a shared cache replays the result on more machines.
+
+Only the project knows which of its tests have such inputs, and has two ways to handle them:
+
+- Record them during the test. Opening a file makes its size and modification time inputs, opening a directory makes every entry's name, size and modification time inputs, and looking up an environment variable makes its value one. Do it from the test, or a helper it calls, not from `TestMain` before `m.Run`, which isn't recorded. With `gobuildcache touch`, modification times change exactly when contents do. For example, a test that runs a binary `TestMain` builds can open each file `go list -deps -json` says the binary is built from, and a test that runs an image an earlier CI job built can look up a variable holding a hash of what the image is built from.
+- Rerun tests in the pipelines that gate merges and releases (see [rerunning cached tests](#rerunning-cached-tests)), as a backstop for inputs a project misses or can't record, such as an image pulled by a tag that moves.
+
 ## rerunning cached tests
 
 `go clean -testcache` expires the test results put before it ran, including ones from the bucket, and unless it's `-readonly`, the job stores the results of rerunning them for later jobs. The go command decides by the time an entry was put, so gobuildcache records it on each action link it uploads (`put_time` metadata) and reports that, not when the entry was downloaded. Refreshing an entry keeps its put time.
