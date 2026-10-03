@@ -156,6 +156,7 @@ func serve(ctx context.Context, bucket *blob.Bucket, opts options, in io.Reader,
 		disk: &Disk{cacheDir: opts.cacheDir},
 	}
 	cacher.bucket = &Bucket{disk: cacher.disk, bucket: bucket, readonly: opts.readonly, refreshAfter: opts.refreshAfter}
+	cacher.bucket.stats.Started = time.Now()
 	cacher.bucket.Start(ctx)
 
 	// The go command sends close before closing stdin, which waits for

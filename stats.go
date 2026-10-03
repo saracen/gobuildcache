@@ -3,6 +3,7 @@ package main
 import (
 	"log/slog"
 	"sync/atomic"
+	"time"
 )
 
 // Stats counts cache activity for one GOCACHEPROG process. The go command
@@ -37,10 +38,29 @@ type Stats struct {
 	// Retries counts bucket calls tried again after a possibly transient
 	// error.
 	Retries atomic.Int64
+
+	// RemoteCalls counts calls to the bucket, and RemoteWaitMillis the time
+	// spent in them, retries included. Calls overlap, so the wait can exceed
+	// how long the process ran; RemotePeakInFlight is how many overlapped at
+	// most, and RemoteSlowestMillis the longest single call.
+	RemoteCalls         atomic.Int64
+	RemoteWaitMillis    atomic.Int64
+	RemoteSlowestMillis atomic.Int64
+	RemotePeakInFlight  atomic.Int64
+	remoteInFlight      atomic.Int64
+
+	// Started is when the process started, for its running time.
+	Started time.Time
 }
 
 func (s *Stats) Log() {
+	var ranMillis int64
+	if !s.Started.IsZero() {
+		ranMillis = time.Since(s.Started).Milliseconds()
+	}
+
 	slog.Info("gobuildcache stats",
+		"ran_ms", ranMillis,
 		"gets", s.Gets.Load(),
 		"hits", s.Hits.Load(),
 		"misses", s.Misses.Load(),
@@ -59,5 +79,9 @@ func (s *Stats) Log() {
 		"refresh_uploads", s.RefreshUploads.Load(),
 		"refresh_errors", s.RefreshErrors.Load(),
 		"retries", s.Retries.Load(),
+		"remote_calls", s.RemoteCalls.Load(),
+		"remote_wait_ms", s.RemoteWaitMillis.Load(),
+		"remote_slowest_ms", s.RemoteSlowestMillis.Load(),
+		"remote_peak_in_flight", s.RemotePeakInFlight.Load(),
 	)
 }

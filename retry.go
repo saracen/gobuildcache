@@ -52,6 +52,28 @@ func retryable(err error) bool {
 func (b *Bucket) withRetry(ctx context.Context, timeout time.Duration, op func(context.Context) error) error {
 	delay := retryDelay
 
+	b.stats.RemoteCalls.Add(1)
+	inFlight := b.stats.remoteInFlight.Add(1)
+	defer b.stats.remoteInFlight.Add(-1)
+	for {
+		peak := b.stats.RemotePeakInFlight.Load()
+		if inFlight <= peak || b.stats.RemotePeakInFlight.CompareAndSwap(peak, inFlight) {
+			break
+		}
+	}
+
+	start := time.Now()
+	defer func() {
+		took := time.Since(start).Milliseconds()
+		b.stats.RemoteWaitMillis.Add(took)
+		for {
+			slowest := b.stats.RemoteSlowestMillis.Load()
+			if took <= slowest || b.stats.RemoteSlowestMillis.CompareAndSwap(slowest, took) {
+				break
+			}
+		}
+	}()
+
 	for attempt := 1; ; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		err := op(attemptCtx)
