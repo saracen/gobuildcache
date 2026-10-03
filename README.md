@@ -42,7 +42,69 @@ Fresh checkouts won't hit the cache if files have new modification times:
 - The go command doesn't cache its index of a directory whose files were just modified.
 - Cached test results record the size and modification time of every file a test opens.
 
-Set every checked-out file's modification time to something stable and in the past, such as a time derived from the file's contents, before running `go`.
+Set every checked-out file's modification time to something stable and in the past, such as a time derived from the file's contents, before running `go`. `gobuildcache touch` does that for a git checkout:
+
+```shell
+gobuildcache touch [-C <dir>] [-repo <path>]...
+```
+
+- Every file git tracks gets a time derived from its blob ID, and every directory one from its tree ID, as Unix seconds before 2020. So each only changes when its contents do, unlike commit times: a shallow clone dates every file it didn't fetch the history of to the oldest commit it fetched, and merged results pipelines check out a new merge commit every time.
+- It touches the whole repository containing `-C`, by default the working directory. Symlinks and submodules are skipped, and tracked files missing from the checkout stay missing.
+- `-repo` gives everything in a repository that git doesn't track, such as one tests clone into the checkout, the time of its `HEAD` commit. It's relative to `-C`, can be repeated, and is skipped if it doesn't exist.
+
+## setting up CI jobs
+
+`gobuildcache setup` decides how a CI job uses the bucket, does what that needs, and prints the variables the job's shell sets, as sh or, with `-shell pwsh`, PowerShell. It supports GitLab CI (`-ci gitlab`). The project's policy, which jobs write and where, is all in its flags, and without `-write-project-id` no job writes:
+
+```yaml
+variables:
+  GOBUILDCACHE_VERSION: v0.2.0
+  # gobuildcache-linux-amd64's line in the release's SHA256SUMS
+  GOBUILDCACHE_SHA256: <sha256>
+  # rerun tests, except in merge request pipelines (see below)
+  GOBUILDCACHE_RERUN_TESTS: "true"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"
+      variables:
+        GOBUILDCACHE_RERUN_TESTS: "false"
+    - when: always
+
+.gobuildcache:
+  id_tokens:
+    GOBUILDCACHE_ID_TOKEN:
+      aud: https://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/ci/providers/gitlab
+  before_script:
+    - bin="${TMPDIR:-/tmp}/gobuildcache"
+    - curl -fsSL -o "$bin" "https://github.com/saracen/gobuildcache/releases/download/$GOBUILDCACHE_VERSION/gobuildcache-linux-amd64"
+    - echo "$GOBUILDCACHE_SHA256  $bin" | sha256sum -c -
+    - chmod +x "$bin"
+    - '"$bin" touch'
+    - >-
+      setup=$("$bin" setup -ci gitlab -bucket gs://bucket -prefix "p/$CI_PROJECT_ID/"
+      -write-project-id 456 -write-branches main -write-tags 'v[0-9.]+'
+      -gcp-workload-identity-provider projects/123/locations/global/workloadIdentityPools/ci/providers/gitlab
+      -rerun-tests="$GOBUILDCACHE_RERUN_TESTS" -flags -stats)
+    - eval "$setup"
+```
+
+Assign the output on a line of its own, as above, so that the job fails when `setup` does: `eval` of a failed command substitution succeeds. In PowerShell, check `$LASTEXITCODE` before `Invoke-Expression ($setup -join "`n")`. Only the variables go to stdout, and messages go to stderr. `GOCACHEPROG` runs the binary that ran `setup`, which the job checked against its checksum.
+
+A job writes only if:
+
+- its `CI_PROJECT_ID` is `-write-project-id`, and its ref is protected;
+- its branch matches `-write-branches`, or its tag `-write-tags`, each a regular expression the whole name must match;
+- its pipeline source is in `-write-sources`, by default `push,web,schedule,api`. A ref's protection doesn't vouch for other pipelines: merge request pipelines can be marked protected, trigger pipelines take any variables, and child and multi-project pipelines carry another pipeline's ref;
+- with `-gcp-workload-identity-provider`, it has an ID token, in `-id-token-var`.
+
+These must say exactly what the bucket's identity provider accepts. A job the provider rejects can't authenticate at all, so it loses its reads too, and one the provider would accept but `setup` doesn't only reads. A pipeline that overrides the variables `setup` reads only makes itself try to write, and fail when the provider checks its token.
+
+Writers with `-gcp-workload-identity-provider` exchange their ID token for access through Workload Identity Federation. `setup` writes the token, and a credentials config for exchanging it, to a new directory under the system's temporary directory that only the job's user can read, so that no CI cache or artifact picks them up, and exports the config's path in `-credentials-var` (default `GOBUILDCACHE_CREDENTIALS`), which `GOCACHEPROG` reads. A test runner that only passes some variables to `go test` must pass that one. Without the flag, writers use whatever credentials gobuildcache finds.
+
+Every other job reads `-read-prefix`, by default `-prefix`, with `?anonymous=true` unless `-anonymous-reads=false`, and keeps what it puts locally, or in `-delta-dir` (see [merge request deltas](#merge-request-deltas)).
+
+`-rerun-tests` runs `go clean -testcache`, creating `GOCACHE` first, and passes `-expire-others`, so every test reruns (see [rerunning cached tests](#rerunning-cached-tests)). Which pipelines rerun tests is the project's choice; the example above reruns them everywhere but merge request pipelines, which don't gate a merge (see [tests with inputs the go command can't see](#tests-with-inputs-the-go-command-cant-see)).
 
 ## merge request deltas
 
@@ -66,6 +128,16 @@ gobuildcache prune -delta-dir <dir> -used-since <when the job started> [-max-siz
 - `-used-since` takes Unix seconds, as `date +%s` prints, or an RFC 3339 time. Take it on the machine running the job, before its first go command: when an entry was used is by that machine's clock. If no entry was used since, as when the job failed before its go commands ran, prune says so and only applies `-max-size`, so that a retry still has the delta.
 - `-max-size` then removes the least recently used entries until their outputs take at most this size, in bytes or with a `KiB`, `MiB` or `GiB` suffix. It can also be used alone. Set it above what a change to the module's most imported package puts: a job whose delta doesn't fit computes what was removed again in every pipeline.
 - Run it after the job's go commands, and before the CI cache saves the delta dir. It only removes what gobuildcache writes there, including temporary files that killed processes left. If it can't remove some of those, such as another user's, it warns and prunes the rest.
+
+With `gobuildcache setup -delta-dir <dir>`, which records when the job started using the delta in `<dir>.started`, prune can take the rest of the decisions a CI job needs, in place of `-used-since`:
+
+```shell
+gobuildcache prune -delta-dir <dir> -started <dir>.started [-failed | -ci gitlab] [-max-size <size>]
+```
+
+- Without the started file, the job didn't use the delta, such as because it wrote to the bucket or its pipeline doesn't get one, so prune removes it, and the CI cache has nothing to save and keeps what it had.
+- Otherwise it removes what the job didn't use since, unless the job failed, `-failed`, or with `-ci gitlab` a `CI_JOB_STATUS` other than `success`: a job that failed may not have used everything it needs, such as the tests it didn't get to, so only `-max-size` applies.
+- If it can't prune the delta, or the delta still takes more than twice `-max-size` on disk, such as because a restored one held other files, it empties it, so that the CI cache saves an empty delta in place of the one restored.
 
 A job trusts the delta as much as whatever wrote the CI cache it came from: in GitLab, any pipeline that can write the project's unprotected caches, which includes any merge request's pipelines running its own CI configuration. Only give one to jobs whose results nothing depends on, such as merge request pipelines that don't gate a merge, and key it to the merge request and the job.
 
@@ -107,6 +179,15 @@ test:
 ```
 
 GitLab saves the cache after `after_script`, which runs even when the job fails, and doesn't save one with no files, as in pipelines without `-delta-dir`. Add `.gobuildcache/` to `.gitignore`: the go command stamps binaries built in a checkout with untracked files as modified.
+
+## tests with inputs the go command can't see
+
+The go command reuses a test's cached result while the test binary and what the test recorded are unchanged: the environment variables it looked up, and the size and modification time of the files and directories it opened or changed into. It only records what the test process does itself, through the `os` package, once `m.Run` starts, and only rechecks files inside the module. So it can't see what a test runs that was built elsewhere, such as a binary `TestMain` builds, a program built from `testdata`, or a container image, and when that changes and nothing it recorded does, it replays the old result. That's how the go command's own cache works, wherever it's kept; a shared cache replays the result on more machines.
+
+Only the project knows which of its tests have such inputs, and has two ways to handle them:
+
+- Record them during the test. Opening a file makes its size and modification time inputs, opening a directory makes every entry's name, size and modification time inputs, and looking up an environment variable makes its value one. Do it from the test, or a helper it calls, not from `TestMain` before `m.Run`, which isn't recorded. With `gobuildcache touch`, modification times change exactly when contents do. For example, a test that runs a binary `TestMain` builds can open each file `go list -deps -json` says the binary is built from, and a test that runs an image an earlier CI job built can look up a variable holding a hash of what the image is built from.
+- Rerun tests in the pipelines that gate merges and releases (see [rerunning cached tests](#rerunning-cached-tests)), as a backstop for inputs a project misses or can't record, such as an image pulled by a tag that moves.
 
 ## rerunning cached tests
 
